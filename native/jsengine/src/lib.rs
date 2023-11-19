@@ -55,14 +55,6 @@ fn load<'a>(env: Env<'a>, js_files: Vec<String>) -> NifResult<Term<'a>> {
 
     let result = receiver.recv().unwrap();
 
-    // match REGISTRY.lock() {
-    //     Ok(mut engine) => {
-    //         Ok(atoms::ok().encode(env))
-    //     },
-    //     Err(_poison_error) => {
-    //         Err(rustler::Error::Atom("mutex_poisoned"))
-    //     }
-    // }
     Ok(match result {
         Ok(value) => (atoms::ok(), json_to_term(env, &value)).encode(env),
         Err(err) => (atoms::error(), json_to_term(env, &err)).encode(env)
@@ -83,7 +75,6 @@ fn run<'a>(env: Env<'a>, code: String) -> NifResult<Term<'a>> {
     Ok(match result {
         Ok(val) => (atoms::ok(), json_to_term(env, &val)).encode(env),
         Err(err) => (atoms::error(), json_to_term(env, &err)).encode(env),
-        // Err(_poison_error) => Err(rustler::Error::Atom("mutex_poisoned"))
     })
 }
 
@@ -96,13 +87,10 @@ fn call<'a>(env: Env<'a>, fn_name: String, args: Vec<Term<'a>>) -> NifResult<Ter
     let global_sender = GLOBAL_CHANNEL.lock().unwrap();
     global_sender.send((Call(fn_name, json_args.into()), sender)).unwrap();
 
-    let _result = receiver.recv().unwrap();
+    let result = receiver.recv().unwrap();
 
-    // match result {
-    //     Ok(Ok(val)) => Ok((atoms::ok(), json_to_term(env, &val)).encode(env)),
-    //     Ok(Err(err)) => Ok((atoms::error(), json_to_term(env, &err)).encode(env)),
-    //     Err(_poison_error) => Err(rustler::Error::Atom("mutex_poisoned"))
-    // }
-
-    Ok(atoms::ok().encode(env))
+    match result {
+        Ok(val) => Ok((atoms::ok(), json_to_term(env, &val)).encode(env)),
+        Err(err) => Ok((atoms::error(), json_to_term(env, &err)).encode(env)),
+    }
 }

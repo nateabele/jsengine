@@ -4,12 +4,32 @@ Run JavaScript code, right inside Elixir. Just like this:
 
 ```elixir
 > JSEngine.load(["/path/to/file.js"]);
-:ok
+{:ok, nil}
 > JSEngine.run("function add(a, b) { return a + b; }")
 {:ok, nil}
 > JSEngine.call("add", [1, 2])
 {:ok, 3}
 ```
+
+### Why?
+
+There are a couple other JS-in-Elixir libraries, but either they're [just wrappers around IPC that serialize your function calls into files](https://github.com/le0pard/elixir_v8/issues/5), or else they have [weird edge cases](https://github.com/le0pard/elixir_v8/issues/5) and [issues compiling](https://github.com/le0pard/elixir_v8/issues/5).
+
+This version is implemented in Rust on top of [Deno Core](https://github.com/denoland/deno_core), so it's modern, reliable, safe, and _fast_—and lives fully within the BEAM.
+
+### Features
+
+- Converts JS values to Elixir terms
+- Converts function arguments passed in `call` from Elixir terms to JS values
+- Automatically unwraps promises
+
+### Roadmap
+
+Because Deno Core has so much packed in, lots more features are within easy reach.
+
+- [ ] **Module loading**: Right now, `load()` just executes single self-contained JS files. With module-loading, it's possible to load an ES module that `import`s dependencies, and have those dependencies loaded automatically.
+- [ ] **TypeScript support**: Automatically load and resolve TypeScript files—no build step required.
+- [ ] **Multiple environments**: Right now, a single JavaScript environment (`v8::Isolate`) is supported, but multiple independent environments could be supported.
 
 ## Installation
 
