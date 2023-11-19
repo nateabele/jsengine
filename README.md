@@ -13,7 +13,7 @@ Run JavaScript code, right inside Elixir. Just like this:
 
 ### Why?
 
-There are a couple other JS-in-Elixir libraries, but either they're [just wrappers around IPC that serialize your function calls into files](https://github.com/le0pard/elixir_v8/issues/5), or else they have [weird edge cases](https://github.com/le0pard/elixir_v8/issues/5) and [issues compiling](https://github.com/le0pard/elixir_v8/issues/5).
+There are a couple other JS-in-Elixir libraries, but either they're [just wrappers around IPC that serialize your function calls into files](https://github.com/le0pard/elixir_v8/issues/5), or else they have [weird edge cases](https://github.com/le0pard/elixir_v8/issues/7) and [issues compiling](https://github.com/le0pard/elixir_v8/issues/5).
 
 This version is implemented in Rust on top of [Deno Core](https://github.com/denoland/deno_core), so it's modern, reliable, safe, and _fast_—and lives fully within the BEAM.
 
