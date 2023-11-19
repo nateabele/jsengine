@@ -371,6 +371,7 @@ version = "0.1.0"
 dependencies = [
  "deno_core",
  "lazy_static",
+ "once_cell",
  "quick-error",
  "rustler",
  "serde",
