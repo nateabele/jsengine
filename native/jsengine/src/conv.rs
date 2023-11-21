@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use deno_core::serde_json::{json, Value};
 use deno_core::serde_v8::Error as SerdeV8Error;
 use deno_core::{anyhow, serde_json};
@@ -25,7 +26,7 @@ pub fn json_to_term<'a>(env: Env<'a>, value: &Value) -> Term<'a> {
             terms.encode(env)
         }
         Value::Object(obj) => {
-            let terms: Vec<(Term, Term)> = obj
+            let terms: HashMap<Term, Term> = obj
                 .iter()
                 .map(|(key, val)| (key.encode(env), json_to_term(env, val)))
                 .collect();

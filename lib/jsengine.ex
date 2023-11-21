@@ -8,7 +8,7 @@ defmodule JSEngine do
   def run(_code \\ :standard), do: error()
 
   @spec call(String.t(), [any()]) :: term()
-  def call(_function_name, _args \\ :standard), do: error()
+  def call(_function_name, _args \\ []), do: error()
 
   defp error(), do: :erlang.nif_error(:nif_not_loaded)
 end
