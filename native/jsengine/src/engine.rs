@@ -72,49 +72,39 @@ impl Engine {
 }
 
 pub async fn call_internal<'a>(js_runtime: &mut JsRuntime, fn_name: &String, args: &Vec<Value>) -> JsResult {
+    let call_result = {
+        let scope = &mut js_runtime.handle_scope();
+        let context = scope.get_current_context();
+        let global = context.global(scope);
 
-  let call_result = {
-      let scope = &mut js_runtime.handle_scope();
-      let context = scope.get_current_context();
-      let global = context.global(scope);
+        let fn_key = v8::String::new(scope, fn_name).ok_or_else(|| Value::String(format!("Error creating V8 string from {}", fn_name)))?;
+        let func = global.get(scope, fn_key.into()).ok_or_else(|| Value::String(format!("Function {} not found", fn_name)))?;
+        let func = v8::Local::<v8::Function>::try_from(func).map_err(|_| Value::String(format!("{} is not a callable function", fn_name)))?;
 
-      let fn_key = v8::String::new(scope, fn_name).unwrap();
-      let func = global.get(scope, fn_key.into()).unwrap();
-      let func = v8::Local::<v8::Function>::try_from(func);
+        let v8_args: Result<Vec<_>, _> = args
+            .iter()
+            .map(|arg| serde_v8::to_v8(scope, arg).map_err(|_| Value::String("Error converting argument to V8 value".to_string())))
+            .collect();
 
-      match func {
-          Ok(func) => {
-              let v8_args: Vec<v8::Local<v8::Value>> = args
-                  .into_iter()
-                  .map(|arg| serde_v8::to_v8(scope, arg).unwrap())
-                  .collect();
-  
-              // @TODO: Remove unwrap, handle safely
-              let local = func.call(scope, global.into(), &v8_args).unwrap();
-              Ok(v8::Global::new(scope, local))
-          },
-          Err(_) => Err(Value::String(format!("{} is not a callable function", fn_name)))
-      }
-  };
+        match v8_args {
+            Ok(v8_args) => func.call(scope, global.into(), &v8_args)
+                .map(|local| v8::Global::new(scope, local))
+                .ok_or_else(|| Value::String(format!("Error calling function {}", fn_name))),
+            Err(e) => Err(e)
+        }
+    };
 
-  match call_result {
-      Ok(result) => {
-          let encoded = js_runtime.resolve_value(result).await.map(|result| {
-              let scope = &mut js_runtime.handle_scope();
-              let local = v8::Local::new(scope, result);
-              serde_v8::from_v8::<Value>(scope, local)
-          });
-      
-          match encoded {
-              Ok(Ok(value)) => Ok(value),
-              Ok(Err(err)) => Err(serde_v8_error_to_json(&err)),
-              Err(err) => Err(anyhow_error_to_json(&err)),
-          }
-      },
-      Err(err) => Err(err)
-  }
+    match call_result {
+        Ok(result) => {
+            js_runtime.resolve_value(result).await.and_then(|result| {
+                let scope = &mut js_runtime.handle_scope();
+                let local = v8::Local::new(scope, result);
+                Ok(serde_v8::from_v8::<Value>(scope, local).map_err(|err| serde_v8_error_to_json(&err)))
+            }).map_err(|err| anyhow_error_to_json(&err))?
+        },
+        Err(err) => Err(err)
+    }
 }
-
 
 async fn eval_raw(js_runtime: &mut JsRuntime, code: &String) -> Result<v8::Global<v8::Value>, anyhow::Error> {
   let module: ModuleCode = FastString::from(code.to_owned());

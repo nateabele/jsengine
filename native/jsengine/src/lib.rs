@@ -69,18 +69,15 @@ fn call<'a>(env: Env<'a>, fn_name: String, args: Vec<Term<'a>>) -> NifResult<Ter
 
 fn send_msg<'a>(env: Env<'a>, msg: Request) -> NifResult<Term<'a>> {
     let (sender, receiver) = channel::<JsResult>();
+    let global_sender = GLOBAL_CHANNEL.lock().map_err(|_| Error::Atom("mutex_poisoned"))?;
 
-    match GLOBAL_CHANNEL.lock() {
-        Ok(global_sender) => {
-            // @TODO Remove unwraps
-            global_sender.send((msg, sender)).unwrap();
-            let result = receiver.recv().unwrap();
-        
-            Ok(match result {
-                Ok(val) => (atoms::ok(), json_to_term(env, &val)).encode(env),
-                Err(err) => (atoms::error(), json_to_term(env, &err)).encode(env),
-            })
-        },
-        Err(_) => Err(Error::Atom("mutex_poisoned"))
+    global_sender.send((msg, sender)).map_err(|_| Error::Atom("sender_error"))?;
+
+    let result = receiver.recv().map_err(|_| Error::Atom("receiver_error"))?;
+
+    match result {
+        Ok(val) => Ok((atoms::ok(), json_to_term(env, &val)).encode(env)),
+        Err(err) => Ok((atoms::error(), json_to_term(env, &err)).encode(env)),
     }
 }
+

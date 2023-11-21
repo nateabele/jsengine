@@ -36,8 +36,17 @@ pub fn json_to_term<'a>(env: Env<'a>, value: &Value) -> Term<'a> {
 }
 
 pub fn term_to_json<'a>(env: Env<'a>, term: Term<'a>) -> Result<Value, rustler::Error> {
-    if let Ok(_atom) = term.decode::<Atom>() {
-        return Ok(Value::String(term_to_string(&term).unwrap()));
+    if let Ok(atom) = term.decode::<Atom>() {
+        if atoms::true_().eq(&atom) {
+            return Ok(Value::Bool(true));
+        } else if atoms::false_().eq(&atom) {
+            return Ok(Value::Bool(false));
+        } else if atoms::nil().eq(&atom) {
+            return Ok(Value::Null);
+        } else {
+            // Handle other atoms as strings
+            return Ok(Value::String(term_to_string(&term).unwrap()));
+        }
     }
     if let Ok(s) = term.decode::<String>() {
         return Ok(Value::String(s));
