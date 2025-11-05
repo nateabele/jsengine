@@ -42,7 +42,7 @@ impl Engine {
         new_engine
     }
 
-    async fn run(&mut self, code: &String) -> JsResult {
+    async fn run(&mut self, code: &str) -> JsResult {
         let result = eval_raw(&mut self.runtime, code).await.map(|val| {
             let scope = &mut self.runtime.handle_scope();
             let local = v8::Local::new(scope, val);
@@ -56,7 +56,7 @@ impl Engine {
         }
     }
 
-    async fn load(&mut self, js_files: &Vec<String>) -> JsResult {
+    async fn load(&mut self, js_files: &[String]) -> JsResult {
         for file_path in js_files {
             let contents = std::fs::read_to_string(file_path).map_err(|e| {
                 Value::String(format!("Failed to read file '{}': {}", file_path, e))
@@ -68,7 +68,7 @@ impl Engine {
         Ok(Value::Null)
     }
 
-    async fn call(&mut self, fn_name: &String, args: &Vec<Value>) -> JsResult {
+    async fn call(&mut self, fn_name: &str, args: &[Value]) -> JsResult {
         call_internal(&mut self.runtime, &fn_name, &args).await
     }
 
@@ -83,8 +83,8 @@ impl Engine {
 
 pub async fn call_internal<'a>(
     js_runtime: &mut JsRuntime,
-    fn_name: &String,
-    args: &Vec<Value>,
+    fn_name: &str,
+    args: &[Value],
 ) -> JsResult {
     let call_result = {
         let scope = &mut js_runtime.handle_scope();
@@ -133,7 +133,7 @@ pub async fn call_internal<'a>(
 
 async fn eval_raw(
     js_runtime: &mut JsRuntime,
-    code: &String,
+    code: &str,
 ) -> Result<v8::Global<v8::Value>, anyhow::Error> {
     let module: ModuleCode = FastString::from(code.to_owned());
     let result = js_runtime.execute_script("[core]", module);
