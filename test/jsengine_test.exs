@@ -1,5 +1,5 @@
 defmodule JSEngineTest do
-  use ExUnit.Case
+  use ExUnit.Case, async: false
   doctest JSEngine
 
   describe "run/1" do
