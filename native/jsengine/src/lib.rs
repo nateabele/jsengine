@@ -95,10 +95,8 @@ fn call<'a>(
     args: Vec<Term<'a>>,
 ) -> NifResult<Term<'a>> {
     let env_id = extract_env_id(env, env_id_term)?;
-    let json_args: Result<Vec<Value>, _> = args
-        .into_iter()
-        .map(|arg| term_to_json(env, arg))
-        .collect();
+    let json_args: Result<Vec<Value>, _> =
+        args.into_iter().map(|arg| term_to_json(env, arg)).collect();
 
     match json_args {
         Ok(arg_vals) => send_msg_raw(env, Call(env_id, fn_name, arg_vals)),
@@ -116,9 +114,7 @@ fn send_msg_raw<'a>(env: Env<'a>, msg: Request) -> NifResult<Term<'a>> {
         .send((msg, sender))
         .map_err(|_| Error::Atom("sender_error"))?;
 
-    let response = receiver
-        .recv()
-        .map_err(|_| Error::Atom("receiver_error"))?;
+    let response = receiver.recv().map_err(|_| Error::Atom("receiver_error"))?;
 
     match response {
         Response::EnvCreated(id) => Ok((atoms::ok(), id).encode(env)),

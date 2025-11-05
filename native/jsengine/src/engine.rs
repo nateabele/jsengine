@@ -1,12 +1,12 @@
 use crate::conv::{anyhow_error_to_json, serde_v8_error_to_json};
 
+use deno_ast::{EmitOptions, MediaType, ParseParams};
 use deno_core::error::AnyError;
 use deno_core::serde_json::Value;
 use deno_core::{
     anyhow, op2, serde_v8, v8, Extension, FastString, FsModuleLoader, JsRuntime, ModuleCode,
     ModuleSpecifier, Op, RuntimeOptions,
 };
-use deno_ast::{EmitOptions, MediaType, ParseParams};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -167,13 +167,11 @@ impl Engine {
         // Transpile TypeScript to JavaScript if needed
         let js_code = transpile_typescript(code, "[inline]").map_err(Value::String)?;
 
-        let result = eval_raw(&mut self.runtime, &js_code)
-            .await
-            .map(|val| {
-                let scope = &mut self.runtime.handle_scope();
-                let local = v8::Local::new(scope, val);
-                serde_v8::from_v8::<Value>(scope, local)
-            });
+        let result = eval_raw(&mut self.runtime, &js_code).await.map(|val| {
+            let scope = &mut self.runtime.handle_scope();
+            let local = v8::Local::new(scope, val);
+            serde_v8::from_v8::<Value>(scope, local)
+        });
 
         match result {
             Ok(Ok(value)) => Ok(value),
@@ -190,14 +188,13 @@ impl Engine {
             })?;
 
             // Convert to file:// URL
-            let module_specifier = ModuleSpecifier::from_file_path(&absolute_path).map_err(
-                |_| {
+            let module_specifier =
+                ModuleSpecifier::from_file_path(&absolute_path).map_err(|_| {
                     Value::String(format!(
                         "Failed to create module specifier from path: {}",
                         absolute_path.display()
                     ))
-                },
-            )?;
+                })?;
 
             // Check if this is a TypeScript file
             let is_typescript = file_path.ends_with(".ts") || file_path.ends_with(".tsx");
