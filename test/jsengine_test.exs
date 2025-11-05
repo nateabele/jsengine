@@ -370,4 +370,82 @@ defmodule JSEngineTest do
       assert {:ok, 100} = JSEngine.call("storedFunc", [10])
     end
   end
+
+  describe "module loading" do
+    test "load() supports ES modules with imports" do
+      calculator_path = Path.expand("test/fixtures/modules/calculator.js")
+
+      assert {:ok, nil} = JSEngine.load([calculator_path])
+      assert {:ok, 8} = JSEngine.call("calculate", [5, 3, "add"])
+      assert {:ok, 15} = JSEngine.call("calculate", [5, 3, "multiply"])
+    end
+  end
+
+  describe "TypeScript support" do
+    test "load() supports TypeScript files with type annotations" do
+      greeter_path = Path.expand("test/fixtures/typescript/greeter.ts")
+
+      assert {:ok, nil} = JSEngine.load([greeter_path])
+      assert {:ok, "Hello, John Doe!"} = JSEngine.call("testGreeting", [])
+
+      person_map = %{"firstName" => "Jane", "lastName" => "Smith"}
+      assert {:ok, "Hello, Jane Smith!"} = JSEngine.call("greet", [person_map])
+    end
+
+    test "run() supports TypeScript code" do
+      # TypeScript code with type annotations
+      ts_code = """
+      function multiply(a: number, b: number): number {
+        return a * b;
+      }
+      globalThis.multiply = multiply;
+      """
+
+      assert {:ok, nil} = JSEngine.run(ts_code)
+      assert {:ok, 42} = JSEngine.call("multiply", [6, 7])
+    end
+  end
+
+  describe "multiple environments" do
+    test "create_env() creates independent JavaScript environments" do
+      # Create two independent environments
+      assert {:ok, env1} = JSEngine.create_env()
+      assert {:ok, env2} = JSEngine.create_env()
+
+      # Each environment should have its own isolated global scope
+      assert {:ok, nil} = JSEngine.run(env1, "globalThis.value = 'env1';")
+      assert {:ok, nil} = JSEngine.run(env2, "globalThis.value = 'env2';")
+
+      # Verify isolation
+      assert {:ok, nil} = JSEngine.run(env1, "globalThis.getValue = () => globalThis.value;")
+      assert {:ok, nil} = JSEngine.run(env2, "globalThis.getValue = () => globalThis.value;")
+
+      assert {:ok, "env1"} = JSEngine.call(env1, "getValue", [])
+      assert {:ok, "env2"} = JSEngine.call(env2, "getValue", [])
+    end
+
+    test "destroy_env() cleans up environment" do
+      assert {:ok, env} = JSEngine.create_env()
+      assert {:ok, nil} = JSEngine.run(env, "globalThis.test = 42;")
+      assert :ok = JSEngine.destroy_env(env)
+
+      # After destroying, operations should fail
+      assert {:error, _} = JSEngine.run(env, "globalThis.test = 42;")
+    end
+
+    test "default environment remains for backward compatibility" do
+      # Functions without env parameter use default environment
+      assert {:ok, nil} = JSEngine.run("globalThis.defaultTest = 'default';")
+
+      # Create a new environment and verify it doesn't affect default
+      assert {:ok, env} = JSEngine.create_env()
+      assert {:ok, nil} = JSEngine.run(env, "globalThis.defaultTest = 'custom';")
+
+      # Default environment should still have original value
+      assert {:ok, nil} =
+               JSEngine.run("globalThis.getDefault = () => globalThis.defaultTest;")
+
+      assert {:ok, "default"} = JSEngine.call("getDefault", [])
+    end
+  end
 end
