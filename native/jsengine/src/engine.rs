@@ -241,14 +241,6 @@ impl Engine {
     async fn call(&mut self, fn_name: &str, args: &[Value]) -> JsResult {
         call_internal(&mut self.runtime, fn_name, args).await
     }
-
-    pub async fn handle(&mut self, req: &Request) -> JsResult {
-        match req {
-            Request::Load(files) => self.load(files).await,
-            Request::Run(code) => self.run(code).await,
-            Request::Call(fn_name, args) => self.call(fn_name, args).await,
-        }
-    }
 }
 
 pub async fn call_internal(js_runtime: &mut JsRuntime, fn_name: &str, args: &[Value]) -> JsResult {
