@@ -18,7 +18,7 @@ use std::thread;
 
 rustler::init!(
     "Elixir.JSEngine",
-    [create_env, destroy_env, load, run, call],
+    [create_env, destroy_env, load_env, run_env, call_env],
     load = init
 );
 
@@ -74,19 +74,19 @@ fn destroy_env<'a>(env: Env<'a>, env_id_term: Term<'a>) -> NifResult<Term<'a>> {
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
-fn load<'a>(env: Env<'a>, env_id_term: Term<'a>, js_files: Vec<String>) -> NifResult<Term<'a>> {
+fn load_env<'a>(env: Env<'a>, env_id_term: Term<'a>, js_files: Vec<String>) -> NifResult<Term<'a>> {
     let env_id = extract_env_id(env, env_id_term)?;
     send_msg_raw(env, Load(env_id, js_files))
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
-fn run<'a>(env: Env<'a>, env_id_term: Term<'a>, code: String) -> NifResult<Term<'a>> {
+fn run_env<'a>(env: Env<'a>, env_id_term: Term<'a>, code: String) -> NifResult<Term<'a>> {
     let env_id = extract_env_id(env, env_id_term)?;
     send_msg_raw(env, Run(env_id, code))
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
-fn call<'a>(
+fn call_env<'a>(
     env: Env<'a>,
     env_id_term: Term<'a>,
     fn_name: String,
