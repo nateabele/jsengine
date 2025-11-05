@@ -35,7 +35,8 @@ pub fn json_to_term<'a>(env: Env<'a>, value: &Value) -> Term<'a> {
     }
 }
 
-pub fn term_to_json<'a>(env: Env<'a>, term: Term<'a>) -> Result<Value, rustler::Error> {
+#[allow(clippy::only_used_in_recursion)]
+pub fn term_to_json(env: Env, term: Term) -> Result<Value, rustler::Error> {
     if let Ok(atom) = term.decode::<Atom>() {
         if atoms::true_().eq(&atom) {
             return Ok(Value::Bool(true));

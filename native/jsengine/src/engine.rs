@@ -5,7 +5,6 @@ use deno_core::serde_json::Value;
 use deno_core::{
     anyhow, op2, serde_v8, v8, Extension, FastString, JsRuntime, ModuleCode, Op, RuntimeOptions,
 };
-use tokio;
 
 pub(crate) type JsResult = Result<Value, Value>;
 
@@ -81,11 +80,7 @@ impl Engine {
     }
 }
 
-pub async fn call_internal<'a>(
-    js_runtime: &mut JsRuntime,
-    fn_name: &str,
-    args: &[Value],
-) -> JsResult {
+pub async fn call_internal(js_runtime: &mut JsRuntime, fn_name: &str, args: &[Value]) -> JsResult {
     let call_result = {
         let scope = &mut js_runtime.handle_scope();
         let context = scope.get_current_context();
@@ -120,11 +115,10 @@ pub async fn call_internal<'a>(
         Ok(result) => js_runtime
             .resolve_value(result)
             .await
-            .and_then(|result| {
+            .map(|result| {
                 let scope = &mut js_runtime.handle_scope();
                 let local = v8::Local::new(scope, result);
-                Ok(serde_v8::from_v8::<Value>(scope, local)
-                    .map_err(|err| serde_v8_error_to_json(&err)))
+                serde_v8::from_v8::<Value>(scope, local).map_err(|err| serde_v8_error_to_json(&err))
             })
             .map_err(|err| anyhow_error_to_json(&err))?,
         Err(err) => Err(err),

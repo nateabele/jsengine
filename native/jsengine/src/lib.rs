@@ -15,11 +15,12 @@ use once_cell::sync::Lazy;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use tokio;
 
 rustler::init!("Elixir.JSEngine", [load, run, call], load = init);
 
-static GLOBAL_CHANNEL: Lazy<Arc<Mutex<Sender<(Request, Sender<JsResult>)>>>> = Lazy::new(|| {
+type ChannelSender = Arc<Mutex<Sender<(Request, Sender<JsResult>)>>>;
+
+static GLOBAL_CHANNEL: Lazy<ChannelSender> = Lazy::new(|| {
     let (sender, receiver) = channel::<(Request, Sender<JsResult>)>();
     let sender = Arc::new(Mutex::new(sender));
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -61,7 +62,7 @@ fn call<'a>(env: Env<'a>, fn_name: String, args: Vec<Term<'a>>) -> NifResult<Ter
         args.into_iter().map(|arg| term_to_json(env, arg)).collect();
 
     match json_args {
-        Ok(arg_vals) => send_msg(env, Call(fn_name, arg_vals.into())),
+        Ok(arg_vals) => send_msg(env, Call(fn_name, arg_vals)),
         Err(_err) => Err(Error::Atom("invalid_type")),
     }
 }
