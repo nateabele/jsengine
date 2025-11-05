@@ -1,8 +1,8 @@
 //! Constants and utilities for conversion between Rust string-likes and Elixir atoms.
 
 use crate::error::Error;
-use rustler::{types::atom::Atom, Encoder, Env, Term};
 use lazy_static::lazy_static;
+use rustler::{types::atom::Atom, Encoder, Env, Term};
 
 lazy_static! {
     pub static ref OK: String = String::from("Ok");

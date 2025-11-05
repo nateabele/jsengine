@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use crate::atoms;
+use crate::error::Error as AtomError;
 use deno_core::serde_json::{json, Value};
 use deno_core::serde_v8::Error as SerdeV8Error;
 use deno_core::{anyhow, serde_json};
 use rustler::{types::atom, Atom, Encoder, Env, Error, Term};
-use crate::atoms;
-use crate::error::Error as AtomError;
+use std::collections::HashMap;
 
 pub fn json_to_term<'a>(env: Env<'a>, value: &Value) -> Term<'a> {
     match value {
@@ -45,7 +45,10 @@ pub fn term_to_json<'a>(env: Env<'a>, term: Term<'a>) -> Result<Value, rustler::
             return Ok(Value::Null);
         } else {
             // Handle other atoms as strings
-            return Ok(Value::String(term_to_string(&term).unwrap()));
+            match term_to_string(&term) {
+                Ok(s) => return Ok(Value::String(s)),
+                Err(_) => return Err(Error::Atom("invalid_atom")),
+            }
         }
     }
     if let Ok(s) = term.decode::<String>() {
@@ -55,7 +58,13 @@ pub fn term_to_json<'a>(env: Env<'a>, term: Term<'a>) -> Result<Value, rustler::
         return Ok(Value::Number(i.into()));
     }
     if let Ok(f) = term.decode::<f64>() {
-        return Ok(Value::Number(serde_json::Number::from_f64(f).unwrap()));
+        // from_f64 returns None for NaN and Infinity
+        if let Some(num) = serde_json::Number::from_f64(f) {
+            return Ok(Value::Number(num));
+        } else {
+            // Handle special float values as null (could also return error)
+            return Ok(Value::Null);
+        }
     }
     if let Ok(list) = term.decode::<Vec<Term>>() {
         let json_list: Result<Vec<_>, _> =
@@ -65,7 +74,12 @@ pub fn term_to_json<'a>(env: Env<'a>, term: Term<'a>) -> Result<Value, rustler::
     if let Ok(map) = term.decode::<std::collections::HashMap<Term, Term>>() {
         let mut json_map = serde_json::Map::new();
         for (key, value) in map {
-            let key_str = term_to_json(env, key)?.as_str().unwrap().to_string();
+            let key_json = term_to_json(env, key)?;
+            // Map keys must be strings in JSON
+            let key_str = match key_json {
+                Value::String(s) => s,
+                _ => return Err(Error::Atom("map_keys_must_be_strings")),
+            };
             json_map.insert(key_str, term_to_json(env, value)?);
         }
         return Ok(Value::Object(json_map));

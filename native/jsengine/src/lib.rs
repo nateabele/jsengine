@@ -1,21 +1,20 @@
 #[allow(unused_imports)]
-
 mod atoms;
 mod conv;
-mod error;
 mod engine;
+mod error;
 
 use crate::conv::{json_to_term, term_to_json};
+use crate::engine::Request::{Call, Load, Run};
 use crate::engine::{Engine, JsResult, Request};
-use crate::engine::Request::{Load, Call, Run};
 
 use deno_core::serde_json::Value;
 use rustler::{Encoder, Env, Error, NifResult, Term};
 
-use std::thread;
-use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{channel, Sender};
 use once_cell::sync::Lazy;
+use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use tokio;
 
 rustler::init!("Elixir.JSEngine", [load, run, call], load = init);
@@ -23,7 +22,10 @@ rustler::init!("Elixir.JSEngine", [load, run, call], load = init);
 static GLOBAL_CHANNEL: Lazy<Arc<Mutex<Sender<(Request, Sender<JsResult>)>>>> = Lazy::new(|| {
     let (sender, receiver) = channel::<(Request, Sender<JsResult>)>();
     let sender = Arc::new(Mutex::new(sender));
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create Tokio runtime - this should never fail");
 
     /* Spawn the master thread */
     thread::spawn(move || {
@@ -38,7 +40,6 @@ static GLOBAL_CHANNEL: Lazy<Arc<Mutex<Sender<(Request, Sender<JsResult>)>>>> = L
 
     sender
 });
-
 
 fn init(_env: Env, _term: rustler::Term) -> bool {
     true
@@ -56,22 +57,24 @@ fn run<'a>(env: Env<'a>, code: String) -> NifResult<Term<'a>> {
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn call<'a>(env: Env<'a>, fn_name: String, args: Vec<Term<'a>>) -> NifResult<Term<'a>> {
-    let json_args: Result<Vec<Value>, _> = args
-        .into_iter()
-        .map(|arg| term_to_json(env, arg))
-        .collect();
+    let json_args: Result<Vec<Value>, _> =
+        args.into_iter().map(|arg| term_to_json(env, arg)).collect();
 
     match json_args {
         Ok(arg_vals) => send_msg(env, Call(fn_name, arg_vals.into())),
-        Err(_err) => Err(Error::Atom("invalid_type"))
+        Err(_err) => Err(Error::Atom("invalid_type")),
     }
 }
 
 fn send_msg<'a>(env: Env<'a>, msg: Request) -> NifResult<Term<'a>> {
     let (sender, receiver) = channel::<JsResult>();
-    let global_sender = GLOBAL_CHANNEL.lock().map_err(|_| Error::Atom("mutex_poisoned"))?;
+    let global_sender = GLOBAL_CHANNEL
+        .lock()
+        .map_err(|_| Error::Atom("mutex_poisoned"))?;
 
-    global_sender.send((msg, sender)).map_err(|_| Error::Atom("sender_error"))?;
+    global_sender
+        .send((msg, sender))
+        .map_err(|_| Error::Atom("sender_error"))?;
 
     let result = receiver.recv().map_err(|_| Error::Atom("receiver_error"))?;
 
@@ -80,4 +83,3 @@ fn send_msg<'a>(env: Env<'a>, msg: Request) -> NifResult<Term<'a>> {
         Err(err) => Ok((atoms::error(), json_to_term(env, &err)).encode(env)),
     }
 }
-
