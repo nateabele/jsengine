@@ -182,55 +182,62 @@ impl Engine {
 
     async fn load(&mut self, js_files: &[String]) -> JsResult {
         for file_path in js_files {
-            // Convert file path to absolute path
-            let absolute_path = std::fs::canonicalize(file_path).map_err(|e| {
-                Value::String(format!("Failed to resolve path {}: {}", file_path, e))
+            // Read the file contents
+            let contents = std::fs::read_to_string(file_path).map_err(|e| {
+                Value::String(format!("Failed to read file '{}': {}", file_path, e))
             })?;
 
-            // Convert to file:// URL
-            let module_specifier =
-                ModuleSpecifier::from_file_path(&absolute_path).map_err(|_| {
-                    Value::String(format!(
-                        "Failed to create module specifier from path: {}",
-                        absolute_path.display()
-                    ))
-                })?;
-
-            // Check if this is a TypeScript file
+            // Determine if this is TypeScript
             let is_typescript = file_path.ends_with(".ts") || file_path.ends_with(".tsx");
 
-            let module_code = if is_typescript {
-                // Read and transpile TypeScript files
-                let contents = std::fs::read_to_string(&absolute_path).map_err(|e| {
-                    Value::String(format!("Failed to read file {}: {}", file_path, e))
-                })?;
-
-                let js_code = transpile_typescript(&contents, file_path).map_err(Value::String)?;
-
-                Some(ModuleCode::from(FastString::from(js_code)))
+            // Transpile TypeScript if needed
+            let js_code = if is_typescript {
+                transpile_typescript(&contents, file_path).map_err(Value::String)?
             } else {
-                // For JavaScript files, let FsModuleLoader handle it
-                None
+                contents.clone()
             };
 
-            // Load the module
-            let mod_id = self
-                .runtime
-                .load_main_module(&module_specifier, module_code)
-                .await
-                .map_err(|e| Value::String(format!("Failed to load module: {}", e)))?;
+            // Determine if this is an ES module (contains import/export statements)
+            let is_module = js_code.contains("import ") || js_code.contains("export ");
 
-            // Evaluate the module
-            let result = self.runtime.mod_evaluate(mod_id);
-            self.runtime
-                .run_event_loop(Default::default())
-                .await
-                .map_err(|e| Value::String(format!("Failed to evaluate module: {}", e)))?;
+            if is_module {
+                // Handle as ES module
+                let absolute_path = std::fs::canonicalize(file_path).map_err(|e| {
+                    Value::String(format!("Failed to resolve path {}: {}", file_path, e))
+                })?;
 
-            // Wait for the module evaluation to complete
-            let _ = result
-                .await
-                .map_err(|e| Value::String(format!("Module evaluation error: {}", e)))?;
+                let module_specifier =
+                    ModuleSpecifier::from_file_path(&absolute_path).map_err(|_| {
+                        Value::String(format!(
+                            "Failed to create module specifier from path: {}",
+                            absolute_path.display()
+                        ))
+                    })?;
+
+                let module_code = ModuleCode::from(FastString::from(js_code));
+
+                // Load the module
+                let mod_id = self
+                    .runtime
+                    .load_main_module(&module_specifier, Some(module_code))
+                    .await
+                    .map_err(|e| Value::String(format!("Failed to load module: {}", e)))?;
+
+                // Evaluate the module
+                let result = self.runtime.mod_evaluate(mod_id);
+                self.runtime
+                    .run_event_loop(Default::default())
+                    .await
+                    .map_err(|e| Value::String(format!("Failed to evaluate module: {}", e)))?;
+
+                // Wait for the module evaluation to complete
+                let _ = result
+                    .await
+                    .map_err(|e| Value::String(format!("Module evaluation error: {}", e)))?;
+            } else {
+                // Handle as regular script (not a module)
+                self.run(&js_code).await?;
+            }
         }
         Ok(Value::Null)
     }
