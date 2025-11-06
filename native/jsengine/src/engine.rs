@@ -27,11 +27,25 @@ pub enum Response {
     Result(JsResult),
 }
 
+// Detect TypeScript code by looking for type annotation patterns
+// that don't occur in regular JavaScript
+fn is_typescript_code(code: &str) -> bool {
+    // Look for function parameter types: "function foo(a: number"
+    // or arrow function param types: "(a: number) =>"
+    // Return type annotations: "): number {"
+    // These patterns don't occur in valid JavaScript
+    code.contains("): ") ||  // Return type annotation
+    (code.contains("(") && code.contains(": ") && (code.contains(") =>") || code.contains(") {")))
+    // Parameter type in function
+}
+
 // Helper function to transpile TypeScript to JavaScript
 fn transpile_typescript(code: &str, specifier: &str) -> Result<String, String> {
-    // Determine media type from file extension only
-    // Don't use heuristics on code content as they can match regular JavaScript
+    // Determine media type from file extension or TypeScript-specific patterns
     let media_type = if specifier.ends_with(".ts") || specifier.ends_with(".tsx") {
+        MediaType::TypeScript
+    } else if is_typescript_code(code) {
+        // For inline code, detect TypeScript by checking for type annotations
         MediaType::TypeScript
     } else {
         MediaType::JavaScript

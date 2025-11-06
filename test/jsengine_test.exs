@@ -401,7 +401,8 @@ defmodule JSEngineTest do
       globalThis.multiply = multiply;
       """
 
-      assert {:ok, nil} = JSEngine.run(ts_code)
+      # Function assignment returns the function (serialized as empty map)
+      assert {:ok, %{}} = JSEngine.run(ts_code)
       assert {:ok, 42} = JSEngine.call("multiply", [6, 7])
     end
   end
