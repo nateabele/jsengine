@@ -52,9 +52,9 @@ fn init(_env: Env, _term: rustler::Term) -> bool {
 }
 
 // Helper function to extract environment ID from term (supports atom :default or integer)
-fn extract_env_id<'a>(env: Env<'a>, term: Term<'a>) -> Result<EnvId, Error> {
+fn extract_env_id<'a>(_env: Env<'a>, term: Term<'a>) -> Result<EnvId, Error> {
     // Try to decode as atom first (for :default)
-    if term.is_atom() && term == atoms::default().encode(env) {
+    if term.is_atom() && atoms::default().eq(&term) {
         return Ok(0);
     }
 
