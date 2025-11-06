@@ -11,6 +11,6 @@ function greet(person: Person): string {
 // Export to global scope for testing
 globalThis.greet = greet;
 
-// Test with a typed object
+// Test function that returns a greeting
 const john: Person = { firstName: "John", lastName: "Doe" };
-globalThis.testGreeting = greet(john);
+globalThis.testGreeting = (): string => greet(john);
