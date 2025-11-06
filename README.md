@@ -27,9 +27,9 @@ This version is implemented in Rust on top of [Deno Core](https://github.com/den
 
 Because Deno Core has so much packed in, lots more features are within easy reach.
 
-- [ ] **Module loading**: Right now, `load()` just executes single self-contained JS files. With module-loading, it's possible to load an ES module that `import`s dependencies, and have those dependencies loaded automatically.
-- [ ] **TypeScript support**: Automatically load and resolve TypeScript files—no build step required.
-- [ ] **Multiple environments**: Right now, a single JavaScript environment (`v8::Isolate`) is supported, but multiple independent environments could be supported.
+- [x] **Module loading**: Right now, `load()` just executes single self-contained JS files. With module-loading, it's possible to load an ES module that `import`s dependencies, and have those dependencies loaded automatically.
+- [x] **TypeScript support**: Automatically load and resolve TypeScript files—no build step required.
+- [x] **Multiple environments**: Right now, a single JavaScript environment (`v8::Isolate`) is supported, but multiple independent environments could be supported.
 
 ## Installation
 
