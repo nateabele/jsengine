@@ -29,11 +29,9 @@ pub enum Response {
 
 // Helper function to transpile TypeScript to JavaScript
 fn transpile_typescript(code: &str, specifier: &str) -> Result<String, String> {
-    // Determine media type from file extension or content
+    // Determine media type from file extension only
+    // Don't use heuristics on code content as they can match regular JavaScript
     let media_type = if specifier.ends_with(".ts") || specifier.ends_with(".tsx") {
-        MediaType::TypeScript
-    } else if specifier.contains("typescript") || code.contains(": ") {
-        // Simple heuristic: if code contains type annotations, treat as TypeScript
         MediaType::TypeScript
     } else {
         MediaType::JavaScript

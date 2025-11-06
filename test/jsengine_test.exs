@@ -413,12 +413,12 @@ defmodule JSEngineTest do
       assert {:ok, env2} = JSEngine.create_env()
 
       # Each environment should have its own isolated global scope
-      assert {:ok, nil} = JSEngine.run(env1, "globalThis.value = 'env1';")
-      assert {:ok, nil} = JSEngine.run(env2, "globalThis.value = 'env2';")
+      assert {:ok, "env1"} = JSEngine.run(env1, "globalThis.value = 'env1';")
+      assert {:ok, "env2"} = JSEngine.run(env2, "globalThis.value = 'env2';")
 
-      # Verify isolation
-      assert {:ok, nil} = JSEngine.run(env1, "globalThis.getValue = () => globalThis.value;")
-      assert {:ok, nil} = JSEngine.run(env2, "globalThis.getValue = () => globalThis.value;")
+      # Verify isolation (function assignment returns the function as empty map)
+      assert {:ok, %{}} = JSEngine.run(env1, "globalThis.getValue = () => globalThis.value;")
+      assert {:ok, %{}} = JSEngine.run(env2, "globalThis.getValue = () => globalThis.value;")
 
       assert {:ok, "env1"} = JSEngine.call(env1, "getValue", [])
       assert {:ok, "env2"} = JSEngine.call(env2, "getValue", [])
@@ -426,7 +426,7 @@ defmodule JSEngineTest do
 
     test "destroy_env() cleans up environment" do
       assert {:ok, env} = JSEngine.create_env()
-      assert {:ok, nil} = JSEngine.run(env, "globalThis.test = 42;")
+      assert {:ok, 42} = JSEngine.run(env, "globalThis.test = 42;")
       assert :ok = JSEngine.destroy_env(env)
 
       # After destroying, operations should fail
@@ -435,14 +435,14 @@ defmodule JSEngineTest do
 
     test "default environment remains for backward compatibility" do
       # Functions without env parameter use default environment
-      assert {:ok, nil} = JSEngine.run("globalThis.defaultTest = 'default';")
+      assert {:ok, "default"} = JSEngine.run("globalThis.defaultTest = 'default';")
 
       # Create a new environment and verify it doesn't affect default
       assert {:ok, env} = JSEngine.create_env()
-      assert {:ok, nil} = JSEngine.run(env, "globalThis.defaultTest = 'custom';")
+      assert {:ok, "custom"} = JSEngine.run(env, "globalThis.defaultTest = 'custom';")
 
       # Default environment should still have original value
-      assert {:ok, nil} =
+      assert {:ok, %{}} =
                JSEngine.run("globalThis.getDefault = () => globalThis.defaultTest;")
 
       assert {:ok, "default"} = JSEngine.call("getDefault", [])
