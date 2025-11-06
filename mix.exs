@@ -7,9 +7,19 @@ defmodule Jsengine.MixProject do
       version: "0.1.0",
       elixir: "~> 1.14",
       start_permanent: Mix.env() == :prod,
+      compilers: [:rustler] ++ Mix.compilers(),
+      rustler_crates: [
+        jsengine: [
+          path: "native/jsengine",
+          mode: rustler_mode(Mix.env())
+        ]
+      ],
       deps: deps()
     ]
   end
+
+  defp rustler_mode(:prod), do: :release
+  defp rustler_mode(_), do: :debug
 
   # Run "mix help compile.app" to learn about applications.
   def application do
