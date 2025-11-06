@@ -27,7 +27,7 @@ defmodule JSEngine do
   def run(env_id, code) when is_binary(code), do: run_env(env_id, code)
 
   @spec call(reference() | atom(), String.t(), [any()]) :: term()
-  def call(env_id, function_name, args \\ []) when is_binary(function_name),
+  def call(env_id, function_name, args) when is_binary(function_name),
     do: call_env(env_id, function_name, args)
 
   # Internal NIFs (replaced by Rust implementations)
