@@ -16,6 +16,7 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+// Register NIFs: create_env/0, destroy_env/1, load_env/2, run_env/2, call_env/3
 rustler::init!(
     "Elixir.JSEngine",
     [create_env, destroy_env, load_env, run_env, call_env],
