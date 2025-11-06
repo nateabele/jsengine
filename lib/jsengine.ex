@@ -1,8 +1,7 @@
 defmodule JSEngine do
   use Rustler,
     otp_app: :jsengine,
-    crate: "jsengine",
-    path: "native/jsengine"
+    crate: :jsengine
 
   # NIFs - these are replaced by Rust implementations
   def create_env(), do: error()
