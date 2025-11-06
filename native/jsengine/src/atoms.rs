@@ -25,5 +25,8 @@ rustler::atoms! {
     unknown, // Other error
     true_ = "true",
     false_ = "false",
-    __struct__
+    __struct__,
+
+    // Environment management
+    default
 }
