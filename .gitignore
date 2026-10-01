@@ -2,3 +2,15 @@
 priv/
 _build/
 deps
+# F0 secret guards
+NOTES
+**/NOTES
+keys/
+*.pem
+*.cer
+*accessKeys.csv
+*credentials*.json
+.env
+.env.*
+!.env.template
+erl_crash.dump
