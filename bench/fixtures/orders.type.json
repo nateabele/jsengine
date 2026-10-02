@@ -1,0 +1,64 @@
+{
+ "kind": "frame",
+ "frame": {
+  "kind": "list"
+ },
+ "axis": {
+  "kind": "axis",
+  "id": "o_orders"
+ },
+ "of": {
+  "kind": "record",
+  "fields": {
+   "id": {
+    "kind": "number"
+   },
+   "qty": {
+    "kind": "frame",
+    "frame": {
+     "kind": "list"
+    },
+    "axis": {
+     "kind": "axis",
+     "id": "o_orders/qty"
+    },
+    "of": {
+     "kind": "number"
+    }
+   },
+   "region": {
+    "kind": "union",
+    "members": [
+     {
+      "kind": "empty"
+     },
+     {
+      "kind": "text"
+     }
+    ]
+   },
+   "status": {
+    "kind": "union",
+    "members": [
+     {
+      "kind": "literal",
+      "value": {
+       "kind": "text",
+       "value": "closed"
+      }
+     },
+     {
+      "kind": "literal",
+      "value": {
+       "kind": "text",
+       "value": "open"
+      }
+     }
+    ]
+   },
+   "total": {
+    "kind": "number"
+   }
+  }
+ }
+}

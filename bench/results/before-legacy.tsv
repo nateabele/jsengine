@@ -1,0 +1,15 @@
+first_call	6.67	ms
+create	2.6	ms
+load_unminified_653k	54.44	ms
+load_minified_175k	7.78	ms
+elm_init	0.46	ms
+warm_check_6rows_simple	0.725	ms
+warm_check_6rows_group	0.582	ms
+warm_check_6rows_coalesce	0.769	ms
+load_table_5000rows	55.86	ms
+warm_check_5k_simple	53.65	ms
+warm_check_5k_coalesce	31.25	ms
+cross_isolate_wait	620.46	ms
+cross_isolate_slow_call	641.47	ms
+rss_per_loaded_isolate	7651	KB
+spin_other_isolate_call	>3000 (blocked)	ms
