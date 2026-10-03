@@ -392,18 +392,23 @@ defmodule JSEngineTest do
       assert {:ok, "Hello, Jane Smith!"} = JSEngine.call("greet", [person_map])
     end
 
-    test "run() supports TypeScript code" do
-      # TypeScript code with type annotations
-      ts_code = """
-      function multiply(a: number, b: number): number {
-        return a * b;
-      }
-      globalThis.multiply = multiply;
-      """
+    test "run() never guesses TypeScript from the content" do
+      # Valid JavaScript that the TypeScript parser reads as a generic call
+      # f<g>(h). The "): " marker used to switch run/1 to the transpiler.
+      code = "var f = 1, g = 2, h = 0; var marker = 'f(x): y'; f < g > (h)"
+      assert {:ok, true} = JSEngine.run(code)
+    end
 
-      # Function assignment returns the function (serialized as empty map)
-      assert {:ok, %{}} = JSEngine.run(ts_code)
-      assert {:ok, 42} = JSEngine.call("multiply", [6, 7])
+    test "run() rejects TypeScript type annotations" do
+      assert {:error, _} = JSEngine.run("function multiply(a: number, b: number): number { return a * b; }")
+    end
+
+    test "load() of a .js file never guesses TypeScript from the content" do
+      path = Path.join(System.tmp_dir!(), "sniff_#{System.unique_integer([:positive])}.js")
+      File.write!(path, "var marker = 'f(x): y'; var f = 1, g = 2, h = 0; var sniffed = f < g > (h);")
+      on_exit(fn -> File.rm(path) end)
+      assert {:ok, nil} = JSEngine.load([path])
+      assert {:ok, true} = JSEngine.run("sniffed")
     end
   end
 

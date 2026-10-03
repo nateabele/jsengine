@@ -27,47 +27,20 @@ pub enum Response {
     Result(JsResult),
 }
 
-// Detect TypeScript code by looking for type annotation patterns
-// that don't occur in regular JavaScript
-fn is_typescript_code(code: &str) -> bool {
-    // Look for function parameter types: "function foo(a: number"
-    // or arrow function param types: "(a: number) =>"
-    // Return type annotations: "): number {"
-    // These patterns don't occur in valid JavaScript
-    code.contains("): ") ||  // Return type annotation
-    (code.contains("(") && code.contains(": ") && (code.contains(") =>") || code.contains(") {")))
-    // Parameter type in function
-}
-
-// Helper function to transpile TypeScript to JavaScript
+// Transpiles a TypeScript file to JavaScript. Only `load` calls this, and
+// only for paths ending in `.ts` or `.tsx`: the content is never inspected
+// to guess the language.
 fn transpile_typescript(code: &str, specifier: &str) -> Result<String, String> {
-    // Determine media type from file extension or TypeScript-specific patterns
-    let media_type = if specifier.ends_with(".ts") || specifier.ends_with(".tsx") {
-        MediaType::TypeScript
-    } else if is_typescript_code(code) {
-        // For inline code, detect TypeScript by checking for type annotations
-        MediaType::TypeScript
-    } else {
-        MediaType::JavaScript
-    };
-
-    // If it's already JavaScript, return as-is
-    if media_type == MediaType::JavaScript {
-        return Ok(code.to_string());
-    }
-
-    // Parse and transpile TypeScript
     let parsed = deno_ast::parse_module(ParseParams {
         specifier: specifier.to_string(),
         text_info: deno_ast::SourceTextInfo::from_string(code.to_string()),
-        media_type,
+        media_type: MediaType::TypeScript,
         capture_tokens: false,
         scope_analysis: false,
         maybe_syntax: None,
     })
     .map_err(|e| format!("Failed to parse TypeScript: {}", e))?;
 
-    // Transpile to JavaScript
     let transpiled = parsed
         .transpile(&EmitOptions {
             inline_sources: false,
@@ -176,10 +149,7 @@ impl Engine {
     }
 
     async fn run(&mut self, code: &str) -> JsResult {
-        // Transpile TypeScript to JavaScript if needed
-        let js_code = transpile_typescript(code, "[inline]").map_err(Value::String)?;
-
-        let result = eval_raw(&mut self.runtime, &js_code).await.map(|val| {
+        let result = eval_raw(&mut self.runtime, code).await.map(|val| {
             let scope = &mut self.runtime.handle_scope();
             let local = v8::Local::new(scope, val);
             serde_v8::from_v8::<Value>(scope, local)
