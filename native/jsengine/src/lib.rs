@@ -3,6 +3,8 @@ mod atoms;
 mod conv;
 mod engine;
 mod error;
+mod isolate;
+mod watchdog;
 
 use crate::conv::{json_to_term, term_to_json};
 use crate::engine::Request::{Call, CreateEnv, DestroyEnv, Load, Run};
