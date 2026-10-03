@@ -51,6 +51,25 @@ defmodule JSEngine.IsolateTest do
       assert {:ok, "1"} = JSEngine.call(isolate, "one", "[]", 1_000)
     end
 
+    test "a load that calls setTimeout at top level works (and does not abort the BEAM)" do
+      isolate = isolate!()
+
+      code =
+        "globalThis.fired = false; setTimeout(() => { globalThis.fired = true; }, 0);" <>
+          " globalThis.settle = () => new Promise((r) => setTimeout(() => r(fired), 20));"
+
+      assert :ok = JSEngine.load_source(isolate, "timer.js", code)
+      assert {:ok, "true"} = JSEngine.call(isolate, "settle", "[]", 1_000)
+    end
+
+    test "a huge timeout is clamped instead of overflowing" do
+      isolate = isolate!()
+      huge = Integer.pow(10, 30)
+      assert :ok = JSEngine.load_source(isolate, "one.js", "globalThis.one = () => 1;", huge)
+      assert {:ok, "1"} = JSEngine.call(isolate, "one", "[]", huge)
+      assert {:ok, "1"} = JSEngine.call(isolate, "one", "[]", 0xFFFF_FFFF_FFFF_FFFF)
+    end
+
     test "a syntax error in loaded source is {:js, msg}" do
       isolate = isolate!()
       assert {:error, {:js, _}} = JSEngine.load_source(isolate, "bad.js", "this is not }{ javascript")

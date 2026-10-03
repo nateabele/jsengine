@@ -31,8 +31,12 @@ defmodule JSEngine do
 
   @default_heap_mb 256
   @default_load_timeout_ms 30_000
+  # Longer deadlines are clamped to this (24 h), here and in the NIF, so a
+  # huge value cannot overflow `receive ... after` or Rust's `Instant`.
+  @max_timeout_ms 86_400_000
   # Extra wait after the deadline before the caller gives up on a reply.
-  @reply_grace_ms 5_000
+  # Configurable (`config :jsengine, reply_grace_ms: ...`) for tests only.
+  @default_reply_grace_ms 5_000
 
   # NIFs - these are replaced by Rust implementations
   def create_env(), do: error()
@@ -53,6 +57,10 @@ defmodule JSEngine do
   def isolate_alive(_isolate), do: error()
   @doc false
   def isolate_test_panic(_isolate, _tag), do: error()
+  @doc false
+  def isolate_test_stall(_isolate, _stall_ms, _timeout_ms, _tag), do: error()
+  @doc false
+  def isolate_cancel(_ticket), do: error()
 
   @doc """
   Starts an isolate on its own OS thread.
@@ -80,16 +88,17 @@ defmodule JSEngine do
           :ok | {:error, failure()}
   def load_source(isolate, name, code, timeout_ms)
       when is_binary(name) and is_binary(code) and is_integer(timeout_ms) and timeout_ms > 0 do
+    timeout_ms = min(timeout_ms, @max_timeout_ms)
     tag = make_ref()
 
     case isolate_load(isolate, name, code, timeout_ms, tag) do
-      :ok ->
+      {:ok, ticket} ->
         # The receive sits next to make_ref/0 so the BEAM skips older
         # messages in a long mailbox instead of scanning them.
         receive do
           {:jsengine_reply, ^tag, result} -> result
         after
-          timeout_ms + @reply_grace_ms -> give_up(isolate)
+          timeout_ms + reply_grace_ms() -> give_up(isolate, ticket, tag)
         end
 
       {:error, _} = error ->
@@ -104,22 +113,30 @@ defmodule JSEngine do
 
   The whole call, including awaiting the promise, must finish within
   `timeout_ms`, or the result is `{:error, :timeout}` and the isolate is gone.
+  A `timeout_ms` above 24 hours is clamped to 24 hours.
+
+  The caller waits in `receive` for a `{:jsengine_reply, tag, result}`
+  message. If the isolate thread is stuck outside JavaScript and has not
+  answered 5 s after the deadline, the request is cancelled, the isolate is
+  destroyed, and the result is `{:error, :timeout}`. A cancelled request never
+  sends its reply, so a `GenServer` caller gets no stray message.
   """
   @spec call(isolate(), String.t(), String.t(), pos_integer()) ::
           {:ok, String.t()} | {:error, failure()}
   def call(isolate, fun_name, args_json, timeout_ms)
       when is_binary(fun_name) and is_binary(args_json) and is_integer(timeout_ms) and
              timeout_ms > 0 do
+    timeout_ms = min(timeout_ms, @max_timeout_ms)
     tag = make_ref()
 
     case isolate_call(isolate, fun_name, args_json, timeout_ms, tag) do
-      :ok ->
+      {:ok, ticket} ->
         # The receive sits next to make_ref/0 so the BEAM skips older
         # messages in a long mailbox instead of scanning them.
         receive do
           {:jsengine_reply, ^tag, result} -> result
         after
-          timeout_ms + @reply_grace_ms -> give_up(isolate)
+          timeout_ms + reply_grace_ms() -> give_up(isolate, ticket, tag)
         end
 
       {:error, _} = error ->
@@ -145,11 +162,30 @@ defmodule JSEngine do
     tag = make_ref()
 
     case isolate_test_panic(isolate, tag) do
-      :ok ->
+      {:ok, ticket} ->
         receive do
           {:jsengine_reply, ^tag, result} -> result
         after
-          5_000 + @reply_grace_ms -> give_up(isolate)
+          5_000 + reply_grace_ms() -> give_up(isolate, ticket, tag)
+        end
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  @doc false
+  # Test hook: like `call/4`, but the isolate thread sleeps `stall_ms` outside
+  # JavaScript, where the deadline cannot stop it. `test_hooks` builds only.
+  def __test_stall__(isolate, stall_ms, timeout_ms) do
+    tag = make_ref()
+
+    case isolate_test_stall(isolate, stall_ms, timeout_ms, tag) do
+      {:ok, ticket} ->
+        receive do
+          {:jsengine_reply, ^tag, result} -> result
+        after
+          timeout_ms + reply_grace_ms() -> give_up(isolate, ticket, tag)
         end
 
       {:error, _} = error ->
@@ -158,12 +194,25 @@ defmodule JSEngine do
   end
 
   # The isolate thread did not answer even after the grace period (it is
-  # stuck outside JavaScript). Discard it; a late reply is a stray
-  # `{:jsengine_reply, _, _}` message that the caller must ignore.
-  defp give_up(isolate) do
+  # stuck outside JavaScript). Cancel the request first, so the isolate
+  # thread never sends its reply, then flush a reply that was already in
+  # flight. No stray `{:jsengine_reply, _, _}` reaches the caller's mailbox.
+  # Then discard the isolate.
+  defp give_up(isolate, ticket, tag) do
+    isolate_cancel(ticket)
+
+    receive do
+      {:jsengine_reply, ^tag, _} -> :ok
+    after
+      0 -> :ok
+    end
+
     isolate_destroy(isolate)
     {:error, :timeout}
   end
+
+  defp reply_grace_ms,
+    do: Application.get_env(:jsengine, :reply_grace_ms, @default_reply_grace_ms)
 
   # Convenience wrappers for default environment
   def load(files) when is_list(files), do: load_env(:default, files)

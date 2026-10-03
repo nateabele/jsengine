@@ -45,6 +45,10 @@ pub enum Reply {
 
 pub type ReplyFn = Box<dyn FnOnce(Reply) + Send + 'static>;
 
+/// The longest deadline a request may have. Longer ones are clamped, so
+/// `Instant + timeout` can never overflow. `JSEngine` clamps to the same value.
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
 pub enum Command {
     /// Runs `code` as a classic script. Never transpiled, never sniffed.
     Load {
@@ -64,6 +68,13 @@ pub enum Command {
     /// Panics on the isolate thread (exposed to Elixir only with the
     /// `test_hooks` feature).
     Panic { reply: ReplyFn },
+    /// Blocks the isolate thread outside JavaScript for `stall` (so the
+    /// watchdog cannot stop it), then replies. `test_hooks` only.
+    Stall {
+        stall: Duration,
+        timeout: Duration,
+        reply: ReplyFn,
+    },
     Shutdown { ack: Option<Sender<()>> },
 }
 
@@ -71,6 +82,7 @@ enum Job {
     Load { name: String, code: String },
     Call { fun: String, args_json: String },
     Panic,
+    Stall(Duration),
 }
 
 /// State shared by the isolate thread, the watchdog and the NIF side.
@@ -137,8 +149,12 @@ impl Isolate {
 
     /// Queues a command. Never blocks on JavaScript: the lock only guards a
     /// non-blocking channel send. `Err(Dead)` means the command was dropped
-    /// unanswered, so the caller must report `Dead` itself.
+    /// unanswered, so the caller must report `Dead` itself. A destroyed
+    /// isolate refuses new work at once, even while its thread is stuck.
     pub fn submit(&self, command: Command) -> Result<(), Failure> {
+        if self.shared.destroyed.load(SeqCst) && !matches!(command, Command::Shutdown { .. }) {
+            return Err(Failure::Dead);
+        }
         let guard = self.sender.lock().map_err(|_| Failure::Dead)?;
         match guard.as_ref() {
             Some(sender) => sender.send(command).map_err(|_| Failure::Dead),
@@ -146,8 +162,9 @@ impl Isolate {
         }
     }
 
+    /// False once the isolate has retired or `shutdown` was called.
     pub fn is_alive(&self) -> bool {
-        !self.shared.dead.load(SeqCst)
+        !self.shared.dead.load(SeqCst) && !self.shared.destroyed.load(SeqCst)
     }
 
     /// Stops a running call, discards the isolate, and (when `wait` is set)
@@ -196,6 +213,11 @@ fn split(command: Command) -> Result<(ReplyFn, Duration, Job), Option<Sender<()>
             reply,
         } => Ok((reply, timeout, Job::Call { fun, args_json })),
         Command::Panic { reply } => Ok((reply, Duration::from_secs(5), Job::Panic)),
+        Command::Stall {
+            stall,
+            timeout,
+            reply,
+        } => Ok((reply, timeout, Job::Stall(stall))),
         Command::Shutdown { ack } => Err(ack),
     }
 }
@@ -211,7 +233,10 @@ fn start(heap_mb: usize) -> Result<Parts, Failure> {
     let params = v8::CreateParams::default().heap_limits(0, heap_bytes);
     let mut runtime = {
         let _enter = tokio_rt.enter();
-        new_runtime(Some(params)).map_err(|e| Failure::Js(e.to_string()))?
+        // The runtime bootstrap is jsengine's own code, not the caller's:
+        // a failure here is a host fault.
+        new_runtime(Some(params))
+            .map_err(|e| Failure::Panic(format!("cannot start the runtime: {e}")))?
     };
     let handle = runtime.v8_isolate().thread_safe_handle();
     let shared = Arc::new(Shared {
@@ -223,9 +248,13 @@ fn start(heap_mb: usize) -> Result<Parts, Failure> {
         dead: AtomicBool::new(false),
     });
     let on_limit = shared.clone();
+    // V8 calls this from an extern "C" frame, where an unwinding panic
+    // aborts the process. The body cannot panic; catch_unwind makes sure.
     runtime.add_near_heap_limit_callback(move |current, _initial| {
-        on_limit.oom.store(true, SeqCst);
-        on_limit.handle.terminate_execution();
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            on_limit.oom.store(true, SeqCst);
+            on_limit.handle.terminate_execution();
+        }));
         // Headroom so V8 can unwind the terminated script instead of aborting.
         current.saturating_mul(2)
     });
@@ -268,24 +297,26 @@ fn isolate_thread(
             Err(payload) => Reply::Failed(Failure::Panic(panic_message(&*payload))),
         };
         let fatal = matches!(&result, Reply::Failed(f) if f.is_fatal());
-        reply(result);
+        if fatal {
+            // Before the reply, so a caller that sees the failure also sees
+            // `is_alive() == false` and gets `Dead` for its next request.
+            refuse_new_commands(&shared, &slot);
+        }
+        answer(reply, result);
         if fatal {
             break;
         }
     }
 
     // Retire: refuse new commands, free the heap, answer what was queued.
-    shared.dead.store(true, SeqCst);
-    if let Ok(mut sender) = slot.lock() {
-        *sender = None;
-    }
+    refuse_new_commands(&shared, &slot);
     {
         let _enter = tokio_rt.enter();
         let _ = catch_unwind(AssertUnwindSafe(move || drop(runtime)));
     }
     for command in receiver.try_iter() {
         match split(command) {
-            Ok((reply, _, _)) => reply(Reply::Failed(Failure::Dead)),
+            Ok((reply, _, _)) => answer(reply, Reply::Failed(Failure::Dead)),
             Err(Some(ack)) => {
                 let _ = ack.send(());
             }
@@ -295,6 +326,18 @@ fn isolate_thread(
     if let Some(ack) = final_ack {
         let _ = ack.send(());
     }
+}
+
+fn refuse_new_commands(shared: &Shared, slot: &Mutex<Option<Sender<Command>>>) {
+    shared.dead.store(true, SeqCst);
+    let mut sender = slot.lock().unwrap_or_else(|p| p.into_inner());
+    *sender = None;
+}
+
+/// Sends a reply. A panic in the reply function (it talks to the BEAM) must
+/// not end the isolate thread before it has retired cleanly.
+fn answer(reply: ReplyFn, result: Reply) {
+    let _ = catch_unwind(AssertUnwindSafe(move || reply(result)));
 }
 
 fn execute(
@@ -307,11 +350,16 @@ fn execute(
     if shared.destroyed.load(SeqCst) {
         return Reply::Failed(Failure::Dead);
     }
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + timeout.min(MAX_TIMEOUT);
     let seq = shared.begin_call();
     watchdog::arm(deadline, shared.clone(), seq);
     let outcome: Result<Reply, String> = match job {
-        Job::Load { name, code } => load_script(runtime, &name, code).map(|()| Reply::Loaded),
+        // Under block_on like a call: an async op that V8 polls eagerly
+        // while the script runs (setTimeout -> tokio::time::sleep) needs the
+        // isolate's tokio runtime, or it panics inside a V8 callback.
+        Job::Load { name, code } => tokio_rt
+            .block_on(async { load_script(runtime, &name, code) })
+            .map(|()| Reply::Loaded),
         Job::Call { fun, args_json } => tokio_rt.block_on(async {
             let limit = tokio::time::Instant::from_std(deadline);
             match tokio::time::timeout_at(limit, call_function(runtime, &fun, &args_json)).await
@@ -324,8 +372,13 @@ fn execute(
             }
         }),
         Job::Panic => panic!("jsengine test hook: deliberate panic"),
+        Job::Stall(stall) => {
+            std::thread::sleep(stall);
+            Ok(Reply::Value("null".to_string()))
+        }
     };
     shared.end_call();
+    watchdog::disarm(deadline, seq);
     classify(shared, outcome)
 }
 

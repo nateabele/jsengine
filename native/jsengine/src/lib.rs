@@ -35,7 +35,9 @@ rustler::init!(
         isolate_call,
         isolate_destroy,
         isolate_alive,
-        isolate_test_panic
+        isolate_cancel,
+        isolate_test_panic,
+        isolate_test_stall
     ],
     load = init
 );
@@ -43,6 +45,11 @@ rustler::init!(
 /// The NIF resource behind `JSEngine.create_isolate/1`. Garbage collection
 /// of the last reference shuts the isolate thread down.
 pub struct IsolateResource(Isolate);
+
+/// One per request. `JSEngine` cancels it when it stops waiting, and a
+/// cancelled request sends no reply, so a late answer never lands in the
+/// caller's mailbox. The mutex makes check-and-send atomic with cancel.
+pub struct ReplyTicket(Mutex<bool>);
 
 type ChannelSender = Arc<Mutex<Sender<(Request, Sender<Response>)>>>;
 
@@ -72,6 +79,7 @@ static GLOBAL_CHANNEL: Lazy<ChannelSender> = Lazy::new(|| {
 #[allow(non_local_definitions)]
 fn init(env: Env, _term: rustler::Term) -> bool {
     rustler::resource!(IsolateResource, env);
+    rustler::resource!(ReplyTicket, env);
     true
 }
 
@@ -187,12 +195,17 @@ fn reply_term<'a>(env: Env<'a>, reply: &Reply) -> Term<'a> {
 }
 
 /// A reply function that sends `{:jsengine_reply, tag, result}` to the
-/// process that made the request. It runs on the isolate thread.
-fn replier(env: Env, tag: Term) -> ReplyFn {
+/// process that made the request, unless `ticket` was cancelled. It runs on
+/// the isolate thread.
+fn replier(env: Env, tag: Term, ticket: ResourceArc<ReplyTicket>) -> ReplyFn {
     let pid = env.pid();
     let owned = OwnedEnv::new();
     let saved_tag = owned.save(tag);
     Box::new(move |reply: Reply| {
+        let cancelled = ticket.0.lock().unwrap_or_else(|p| p.into_inner());
+        if *cancelled {
+            return;
+        }
         let mut owned = owned;
         let _ = owned.send_and_clear(&pid, |env| {
             (atoms::jsengine_reply(), saved_tag.load(env), reply_term(env, &reply)).encode(env)
@@ -200,9 +213,16 @@ fn replier(env: Env, tag: Term) -> ReplyFn {
     })
 }
 
-fn queued<'a>(env: Env<'a>, resource: &IsolateResource, command: Command) -> Term<'a> {
-    match resource.0.submit(command) {
-        Ok(()) => atoms::ok().encode(env),
+/// Queues the command built by `make` and returns `{:ok, ticket}`.
+fn queued<'a>(
+    env: Env<'a>,
+    resource: &IsolateResource,
+    tag: Term<'a>,
+    make: impl FnOnce(ReplyFn) -> Command,
+) -> Term<'a> {
+    let ticket = ResourceArc::new(ReplyTicket(Mutex::new(false)));
+    match resource.0.submit(make(replier(env, tag, ticket.clone()))) {
+        Ok(()) => (atoms::ok(), ticket).encode(env),
         Err(failure) => error_term(env, &failure),
     }
 }
@@ -225,17 +245,18 @@ fn isolate_load<'a>(
     tag: Term<'a>,
 ) -> Term<'a> {
     guard(env, || {
-        let command = Command::Load {
+        queued(env, &resource, tag, |reply| Command::Load {
             name,
             code,
             timeout: Duration::from_millis(timeout_ms),
-            reply: replier(env, tag),
-        };
-        queued(env, &resource, command)
+            reply,
+        })
     })
 }
 
-#[rustler::nif]
+// Dirty: decoding and copying a multi-MB `args_json` must not hold a normal
+// scheduler.
+#[rustler::nif(schedule = "DirtyCpu")]
 fn isolate_call<'a>(
     env: Env<'a>,
     resource: ResourceArc<IsolateResource>,
@@ -245,13 +266,12 @@ fn isolate_call<'a>(
     tag: Term<'a>,
 ) -> Term<'a> {
     guard(env, || {
-        let command = Command::Call {
+        queued(env, &resource, tag, |reply| Command::Call {
             fun,
             args_json,
             timeout: Duration::from_millis(timeout_ms),
-            reply: replier(env, tag),
-        };
-        queued(env, &resource, command)
+            reply,
+        })
     })
 }
 
@@ -269,6 +289,14 @@ fn isolate_alive(env: Env, resource: ResourceArc<IsolateResource>) -> Term {
 }
 
 #[rustler::nif]
+fn isolate_cancel(env: Env, ticket: ResourceArc<ReplyTicket>) -> Term {
+    guard(env, || {
+        *ticket.0.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        atoms::ok().encode(env)
+    })
+}
+
+#[rustler::nif]
 fn isolate_test_panic<'a>(
     env: Env<'a>,
     resource: ResourceArc<IsolateResource>,
@@ -276,7 +304,28 @@ fn isolate_test_panic<'a>(
 ) -> Term<'a> {
     guard(env, || {
         if cfg!(feature = "test_hooks") {
-            queued(env, &resource, Command::Panic { reply: replier(env, tag) })
+            queued(env, &resource, tag, |reply| Command::Panic { reply })
+        } else {
+            (atoms::error(), atoms::unsupported()).encode(env)
+        }
+    })
+}
+
+#[rustler::nif]
+fn isolate_test_stall<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<IsolateResource>,
+    stall_ms: u64,
+    timeout_ms: u64,
+    tag: Term<'a>,
+) -> Term<'a> {
+    guard(env, || {
+        if cfg!(feature = "test_hooks") {
+            queued(env, &resource, tag, |reply| Command::Stall {
+                stall: Duration::from_millis(stall_ms),
+                timeout: Duration::from_millis(timeout_ms),
+                reply,
+            })
         } else {
             (atoms::error(), atoms::unsupported()).encode(env)
         }

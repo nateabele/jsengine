@@ -156,3 +156,50 @@ fn shutdown_answers_queued_requests_with_dead() {
     assert!(!isolate.is_alive());
     assert_eq!(call(&isolate, "one", "[]", TIMEOUT), Reply::Failed(Failure::Dead));
 }
+
+#[test]
+fn a_load_that_calls_set_timeout_at_top_level_does_not_abort() {
+    let isolate = Isolate::spawn(64).expect("spawn");
+    assert_eq!(
+        load(&isolate, "globalThis.fired = false; setTimeout(() => { globalThis.fired = true; }, 0); globalThis.check = () => fired;"),
+        Reply::Loaded
+    );
+    assert!(isolate.is_alive());
+    let later = "globalThis.settle = () => new Promise((r) => setTimeout(() => r(fired), 20));";
+    assert_eq!(load(&isolate, later), Reply::Loaded);
+    assert_eq!(call(&isolate, "settle", "[]", TIMEOUT), Reply::Value("true".into()));
+}
+
+#[test]
+fn set_timeout_with_odd_delays_never_kills_the_isolate() {
+    let isolate = Isolate::spawn(64).expect("spawn");
+    for code in ["setTimeout(() => {}, -1);", "setTimeout(() => {}, 1e300);", "setTimeout(() => {}, NaN);", "setTimeout(() => {}, 'x');"] {
+        match load(&isolate, code) {
+            Reply::Loaded | Reply::Failed(Failure::Js(_)) => {}
+            other => panic!("{code}: expected Loaded or a JS failure, got {other:?}"),
+        }
+        assert!(isolate.is_alive(), "{code} killed the isolate");
+    }
+    load(&isolate, "globalThis.one = () => 1;");
+    assert_eq!(call(&isolate, "one", "[]", TIMEOUT), Reply::Value("1".into()));
+}
+
+#[test]
+fn finished_calls_leave_no_watchdog_entries() {
+    let isolate = Isolate::spawn(64).expect("spawn");
+    load(&isolate, "globalThis.one = () => 1;");
+    for _ in 0..500 {
+        assert_eq!(call(&isolate, "one", "[]", Duration::from_secs(600)), Reply::Value("1".into()));
+    }
+    // Other tests run concurrently and may hold a few live entries.
+    let pending = crate::watchdog::pending();
+    assert!(pending < 50, "{pending} watchdog entries left after 500 finished calls");
+}
+
+#[test]
+fn a_huge_timeout_is_clamped_instead_of_overflowing() {
+    let isolate = Isolate::spawn(64).expect("spawn");
+    load(&isolate, "globalThis.one = () => 1;");
+    assert_eq!(call(&isolate, "one", "[]", Duration::MAX), Reply::Value("1".into()));
+    assert!(isolate.is_alive());
+}

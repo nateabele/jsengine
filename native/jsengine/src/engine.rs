@@ -7,7 +7,10 @@ use deno_core::{
     anyhow, op2, serde_v8, v8, Extension, FastString, FsModuleLoader, JsRuntime, ModuleCode,
     ModuleSpecifier, Op, RuntimeOptions,
 };
+use crate::isolate::panic_message;
+use deno_core::futures::FutureExt;
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 
 pub(crate) type JsResult = Result<Value, Value>;
@@ -291,8 +294,19 @@ async fn eval_raw(
     }
 }
 
+// deno_core may poll this future inside a V8 callback (an extern "C"
+// frame), where an unwinding panic aborts the process. A panic (for example
+// tokio::time::sleep with no runtime on the thread) becomes a rejected
+// promise instead. Bad delays (negative, NaN, non-numbers) never get here:
+// the #[serde] u64 conversion throws a TypeError in JavaScript, and tokio
+// clamps huge delays to its far future.
 #[op2(async)]
 async fn op_set_timeout(#[serde] delay: u64) -> Result<(), AnyError> {
-    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-    Ok(())
+    // The async block defers creating the timer into the guarded poll.
+    AssertUnwindSafe(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await
+    })
+    .catch_unwind()
+    .await
+    .map_err(|payload| anyhow::anyhow!("setTimeout failed: {}", panic_message(&*payload)))
 }

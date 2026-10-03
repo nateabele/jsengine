@@ -1,55 +1,29 @@
 //! One process-wide thread that enforces call deadlines.
 //!
-//! An isolate thread arms an entry before it runs JavaScript. When the
-//! deadline passes and the same call is still running, the watchdog marks
-//! the isolate timed out and calls `terminate_execution` on it. This is the
-//! only way to stop JavaScript that never yields (`while(true){}`).
+//! An isolate thread arms an entry before it runs JavaScript and disarms it
+//! when the request finishes, so the queue only holds requests in flight.
+//! When a deadline passes and the same call is still running, the watchdog
+//! marks the isolate timed out and calls `terminate_execution` on it. This is
+//! the only way to stop JavaScript that never yields (`while(true){}`).
 
 use crate::isolate::Shared;
 use once_cell::sync::Lazy;
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::BTreeMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
-struct Entry {
-    deadline: Instant,
-    seq: u64,
-    shared: Arc<Shared>,
-}
-
-impl PartialEq for Entry {
-    fn eq(&self, other: &Self) -> bool {
-        self.deadline == other.deadline && self.seq == other.seq
-    }
-}
-
-impl Eq for Entry {}
-
-impl PartialOrd for Entry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Entry {
-    // Reversed, so that BinaryHeap (a max-heap) pops the earliest deadline.
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .deadline
-            .cmp(&self.deadline)
-            .then_with(|| other.seq.cmp(&self.seq))
-    }
-}
+/// Deadlines in order; `seq` is unique per call, so keys never collide.
+type Queue = BTreeMap<(Instant, u64), Arc<Shared>>;
 
 struct Watchdog {
-    queue: Mutex<BinaryHeap<Entry>>,
+    queue: Mutex<Queue>,
     wake: Condvar,
 }
 
 static WATCHDOG: Lazy<&'static Watchdog> = Lazy::new(|| {
     let watchdog: &'static Watchdog = Box::leak(Box::new(Watchdog {
-        queue: Mutex::new(BinaryHeap::new()),
+        queue: Mutex::new(BTreeMap::new()),
         wake: Condvar::new(),
     }));
     std::thread::Builder::new()
@@ -59,34 +33,44 @@ static WATCHDOG: Lazy<&'static Watchdog> = Lazy::new(|| {
     watchdog
 });
 
+fn queue(watchdog: &Watchdog) -> std::sync::MutexGuard<'_, Queue> {
+    watchdog
+        .queue
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Arms a deadline for call `seq` of the isolate behind `shared`.
 pub(crate) fn arm(deadline: Instant, shared: Arc<Shared>, seq: u64) {
     let watchdog = *WATCHDOG;
-    let mut queue = watchdog
-        .queue
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    queue.push(Entry {
-        deadline,
-        seq,
-        shared,
-    });
+    queue(watchdog).insert((deadline, seq), shared);
     watchdog.wake.notify_one();
 }
 
+/// Removes the entry of a call that finished before its deadline.
+pub(crate) fn disarm(deadline: Instant, seq: u64) {
+    queue(*WATCHDOG).remove(&(deadline, seq));
+}
+
+#[cfg(test)]
+pub(crate) fn pending() -> usize {
+    queue(*WATCHDOG).len()
+}
+
 fn run(watchdog: &'static Watchdog) {
-    let mut queue = watchdog
-        .queue
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut queue = queue(watchdog);
     loop {
         let now = Instant::now();
-        while queue.peek().map_or(false, |top| top.deadline <= now) {
-            if let Some(entry) = queue.pop() {
-                entry.shared.expire(entry.seq);
+        while let Some(entry) = queue.first_entry() {
+            if entry.key().0 > now {
+                break;
             }
+            let ((_, seq), shared) = entry.remove_entry();
+            // A panic here would end the watchdog thread and every deadline
+            // with it; expire() cannot panic, but never bet the thread on it.
+            let _ = catch_unwind(AssertUnwindSafe(|| shared.expire(seq)));
         }
-        queue = match queue.peek().map(|top| top.deadline) {
+        queue = match queue.first_key_value().map(|((deadline, _), _)| *deadline) {
             Some(deadline) => {
                 let wait = deadline.saturating_duration_since(Instant::now());
                 watchdog
