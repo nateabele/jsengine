@@ -9,6 +9,11 @@ name = "jsengine"
 path = "src/lib.rs"
 crate-type = ["cdylib"]
 
+[features]
+# Exposes JSEngine.__test_panic__/1, which panics an isolate thread on
+# purpose. Turned on by lib/jsengine.ex when MIX_ENV=test.
+test_hooks = []
+
 [dependencies]
 rustler = "0.30.0"
 serde = { version = "1.0", features = ["derive"] }

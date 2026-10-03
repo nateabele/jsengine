@@ -28,5 +28,14 @@ rustler::atoms! {
     __struct__,
 
     // Environment management
-    default
+    default,
+
+    // Hardened isolates (F2)
+    timeout,
+    oom,
+    panic_ = "panic",
+    js,
+    dead,
+    unsupported,
+    jsengine_reply,
 }

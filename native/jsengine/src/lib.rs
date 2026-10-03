@@ -9,21 +9,40 @@ mod watchdog;
 use crate::conv::{json_to_term, term_to_json};
 use crate::engine::Request::{Call, CreateEnv, DestroyEnv, Load, Run};
 use crate::engine::{EngineManager, EnvId, Request, Response};
+use crate::isolate::{panic_message, Command, Failure, Isolate, Reply, ReplyFn};
 
 use deno_core::serde_json::Value;
-use rustler::{Encoder, Env, Error, NifResult, Term};
+use rustler::env::OwnedEnv;
+use rustler::{Encoder, Env, Error, NifResult, ResourceArc, Term};
 
 use once_cell::sync::Lazy;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
-// Register NIFs: create_env/0, destroy_env/1, load_env/2, run_env/2, call_env/3
 rustler::init!(
     "Elixir.JSEngine",
-    [create_env, destroy_env, load_env, run_env, call_env],
+    [
+        create_env,
+        destroy_env,
+        load_env,
+        run_env,
+        call_env,
+        isolate_new,
+        isolate_load,
+        isolate_call,
+        isolate_destroy,
+        isolate_alive,
+        isolate_test_panic
+    ],
     load = init
 );
+
+/// The NIF resource behind `JSEngine.create_isolate/1`. Garbage collection
+/// of the last reference shuts the isolate thread down.
+pub struct IsolateResource(Isolate);
 
 type ChannelSender = Arc<Mutex<Sender<(Request, Sender<Response>)>>>;
 
@@ -49,7 +68,10 @@ static GLOBAL_CHANNEL: Lazy<ChannelSender> = Lazy::new(|| {
     sender
 });
 
-fn init(_env: Env, _term: rustler::Term) -> bool {
+// rustler 0.30's resource! macro expands to an impl inside this function.
+#[allow(non_local_definitions)]
+fn init(env: Env, _term: rustler::Term) -> bool {
+    rustler::resource!(IsolateResource, env);
     true
 }
 
@@ -126,4 +148,137 @@ fn send_msg_raw<'a>(env: Env<'a>, msg: Request) -> NifResult<Term<'a>> {
         Response::Result(Ok(val)) => Ok((atoms::ok(), json_to_term(env, &val)).encode(env)),
         Response::Result(Err(err)) => Ok((atoms::error(), json_to_term(env, &err)).encode(env)),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Hardened isolates (F2). Each isolate runs on its own OS thread. Requests are
+// queued without waiting; the isolate thread sends
+// `{:jsengine_reply, tag, result}` to the calling process when it is done.
+// ---------------------------------------------------------------------------
+
+/// Runs a NIF body and turns a Rust panic into `{:error, {:panic, msg}}`.
+fn guard<'a>(env: Env<'a>, body: impl FnOnce() -> Term<'a>) -> Term<'a> {
+    match catch_unwind(AssertUnwindSafe(body)) {
+        Ok(term) => term,
+        Err(payload) => error_term(env, &Failure::Panic(panic_message(&*payload))),
+    }
+}
+
+fn failure_term<'a>(env: Env<'a>, failure: &Failure) -> Term<'a> {
+    match failure {
+        Failure::Timeout => atoms::timeout().encode(env),
+        Failure::Oom => atoms::oom().encode(env),
+        Failure::Dead => atoms::dead().encode(env),
+        Failure::Panic(message) => (atoms::panic_(), message.as_str()).encode(env),
+        Failure::Js(message) => (atoms::js(), message.as_str()).encode(env),
+    }
+}
+
+fn error_term<'a>(env: Env<'a>, failure: &Failure) -> Term<'a> {
+    (atoms::error(), failure_term(env, failure)).encode(env)
+}
+
+fn reply_term<'a>(env: Env<'a>, reply: &Reply) -> Term<'a> {
+    match reply {
+        Reply::Loaded => atoms::ok().encode(env),
+        Reply::Value(json) => (atoms::ok(), json.as_str()).encode(env),
+        Reply::Failed(failure) => error_term(env, failure),
+    }
+}
+
+/// A reply function that sends `{:jsengine_reply, tag, result}` to the
+/// process that made the request. It runs on the isolate thread.
+fn replier(env: Env, tag: Term) -> ReplyFn {
+    let pid = env.pid();
+    let owned = OwnedEnv::new();
+    let saved_tag = owned.save(tag);
+    Box::new(move |reply: Reply| {
+        let mut owned = owned;
+        let _ = owned.send_and_clear(&pid, |env| {
+            (atoms::jsengine_reply(), saved_tag.load(env), reply_term(env, &reply)).encode(env)
+        });
+    })
+}
+
+fn queued<'a>(env: Env<'a>, resource: &IsolateResource, command: Command) -> Term<'a> {
+    match resource.0.submit(command) {
+        Ok(()) => atoms::ok().encode(env),
+        Err(failure) => error_term(env, &failure),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn isolate_new(env: Env, heap_mb: u64) -> Term {
+    guard(env, || match Isolate::spawn(heap_mb as usize) {
+        Ok(isolate) => (atoms::ok(), ResourceArc::new(IsolateResource(isolate))).encode(env),
+        Err(failure) => error_term(env, &failure),
+    })
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn isolate_load<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<IsolateResource>,
+    name: String,
+    code: String,
+    timeout_ms: u64,
+    tag: Term<'a>,
+) -> Term<'a> {
+    guard(env, || {
+        let command = Command::Load {
+            name,
+            code,
+            timeout: Duration::from_millis(timeout_ms),
+            reply: replier(env, tag),
+        };
+        queued(env, &resource, command)
+    })
+}
+
+#[rustler::nif]
+fn isolate_call<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<IsolateResource>,
+    fun: String,
+    args_json: String,
+    timeout_ms: u64,
+    tag: Term<'a>,
+) -> Term<'a> {
+    guard(env, || {
+        let command = Command::Call {
+            fun,
+            args_json,
+            timeout: Duration::from_millis(timeout_ms),
+            reply: replier(env, tag),
+        };
+        queued(env, &resource, command)
+    })
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn isolate_destroy(env: Env, resource: ResourceArc<IsolateResource>) -> Term {
+    guard(env, || {
+        resource.0.shutdown(Some(Duration::from_secs(2)));
+        atoms::ok().encode(env)
+    })
+}
+
+#[rustler::nif]
+fn isolate_alive(env: Env, resource: ResourceArc<IsolateResource>) -> Term {
+    guard(env, || resource.0.is_alive().encode(env))
+}
+
+#[rustler::nif]
+fn isolate_test_panic<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<IsolateResource>,
+    tag: Term<'a>,
+) -> Term<'a> {
+    guard(env, || {
+        if cfg!(feature = "test_hooks") {
+            queued(env, &resource, Command::Panic { reply: replier(env, tag) })
+        } else {
+            (atoms::error(), atoms::unsupported()).encode(env)
+        }
+    })
 }
