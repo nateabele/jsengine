@@ -105,9 +105,12 @@ fn call_env<'a>(
 
 fn send_msg_raw<'a>(env: Env<'a>, msg: Request) -> NifResult<Term<'a>> {
     let (sender, receiver) = channel::<Response>();
+    // Clone the sender and release the global mutex before waiting, so a
+    // caller blocked on a reply never holds the lock.
     let global_sender = GLOBAL_CHANNEL
         .lock()
-        .map_err(|_| Error::Atom("mutex_poisoned"))?;
+        .map_err(|_| Error::Atom("mutex_poisoned"))?
+        .clone();
 
     global_sender
         .send((msg, sender))

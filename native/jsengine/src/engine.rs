@@ -51,6 +51,26 @@ fn transpile_typescript(code: &str, specifier: &str) -> Result<String, String> {
     Ok(transpiled.text)
 }
 
+/// Builds a JsRuntime with the jsengine host APIs (console, setTimeout).
+/// `create_params` carries the heap limits of a hardened isolate; the legacy
+/// engine passes `None`.
+pub(crate) fn new_runtime(
+    create_params: Option<v8::CreateParams>,
+) -> Result<JsRuntime, anyhow::Error> {
+    let mut runtime = JsRuntime::new(RuntimeOptions {
+        module_loader: Some(Rc::new(FsModuleLoader)),
+        create_params,
+        extensions: vec![Extension {
+            name: "core:apis",
+            ops: std::borrow::Cow::Borrowed(&[op_set_timeout::DECL]),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    runtime.execute_script_static("[core:runtime]", include_str!("./runtime.js"))?;
+    Ok(runtime)
+}
+
 pub(crate) struct Engine {
     runtime: JsRuntime,
 }
@@ -126,26 +146,10 @@ impl EngineManager {
 
 impl Engine {
     pub fn new() -> Self {
-        let mut new_engine = Engine {
-            runtime: JsRuntime::new(RuntimeOptions {
-                module_loader: Some(Rc::new(FsModuleLoader)),
-                extensions: vec![Extension {
-                    name: "core:apis",
-                    ops: std::borrow::Cow::Borrowed(&[op_set_timeout::DECL]),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }),
-        };
-        // This should never fail as runtime.js is embedded at compile time
-        if let Err(e) = new_engine
-            .runtime
-            .execute_script_static("[core:runtime]", include_str!("./runtime.js"))
-        {
-            panic!("Failed to initialize JavaScript runtime: {:?}", e);
+        match new_runtime(None) {
+            Ok(runtime) => Engine { runtime },
+            Err(e) => panic!("Failed to initialize JavaScript runtime: {:?}", e),
         }
-
-        new_engine
     }
 
     async fn run(&mut self, code: &str) -> JsResult {
