@@ -263,7 +263,11 @@ fn snapshot_thread(
         .v8_isolate()
         .remove_near_heap_limit_callback(heap_guard_near_limit, 0);
     // Always consume the runtime through `snapshot`: dropping a snapshotting
-    // runtime leaks its isolate.
+    // runtime leaks its isolate. This holds after a failure too, the tripped
+    // heap cap included: the heap (up to about `heap_mb`, still reachable from
+    // the script's globals) is serialised once and the blob thrown away. That
+    // costs time and a transient copy, but it is the only way deno_core 0.230
+    // frees a snapshotting isolate.
     let blob = runtime.snapshot();
     drop(guard);
     match failure {

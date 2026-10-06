@@ -110,8 +110,32 @@ defmodule JSEngine.SnapshotTest do
     assert {:ok, "332833500"} = JSEngine.call(isolate!(%{snapshot: snapshot!()}), "sum", "[]", 5_000)
   end
 
-  test "snapshot_for/3 remembers a failure until the bundle changes" do
+  test "snapshot_for/3 remembers a deterministic failure until the bundle changes" do
     name = "failing-#{System.unique_integer([:positive])}.js"
+    on_exit(fn -> JSEngine.forget_snapshot(name) end)
+    # Throws after 300 ms of work, so a retry is visible in the time taken.
+    late = "const end = Date.now() + 300; while (Date.now() < end) {} throw new Error('late');"
+
+    {first_us, first} = :timer.tc(fn -> JSEngine.snapshot_for(name, late) end)
+    assert {:error, {:js, msg}} = first
+    assert msg =~ "late"
+    assert first_us >= 300_000
+
+    # Not tried again: the same error at once.
+    {again_us, again} = :timer.tc(fn -> JSEngine.snapshot_for(name, late) end)
+    assert again == first
+    assert again_us < 100_000, "retried: #{again_us} us"
+
+    # A changed bundle is a new key and is tried.
+    assert {:ok, _} = JSEngine.snapshot_for(name, @bundle)
+    # forget_snapshot/1 clears the entry, so the failure is tried again.
+    JSEngine.forget_snapshot(name)
+    {retry_us, {:error, {:js, _}}} = :timer.tc(fn -> JSEngine.snapshot_for(name, late) end)
+    assert retry_us >= 300_000
+  end
+
+  test "snapshot_for/3 does not remember a timeout: the next call tries again" do
+    name = "slow-#{System.unique_integer([:positive])}.js"
     on_exit(fn -> JSEngine.forget_snapshot(name) end)
     spin = "for (;;) {}"
 
@@ -119,17 +143,21 @@ defmodule JSEngine.SnapshotTest do
     assert first == {:error, :timeout}
     assert first_us >= 300_000
 
-    # Not tried again: the same error at once.
     {again_us, again} = :timer.tc(fn -> JSEngine.snapshot_for(name, spin, %{timeout_ms: 300}) end)
     assert again == {:error, :timeout}
-    assert again_us < 100_000, "retried: #{again_us} us"
+    assert again_us >= 300_000, "a cached timeout came back in #{again_us} us"
+  end
 
-    # A changed bundle is a new key and is tried.
+  test "create_snapshot/3 and snapshot_for/3 refuse a timeout or heap that is not a positive integer" do
+    for opts <- [%{timeout_ms: 0}, %{timeout_ms: -1}, %{timeout_ms: 1.5}, %{heap_mb: 0}, %{heap_mb: -5}, %{heap_mb: nil}] do
+      assert {:error, :badarg} = JSEngine.create_snapshot("bundle.js", @bundle, opts), inspect(opts)
+    end
+
+    name = "badarg-#{System.unique_integer([:positive])}.js"
+    on_exit(fn -> JSEngine.forget_snapshot(name) end)
+    assert {:error, :badarg} = JSEngine.snapshot_for(name, @bundle, %{timeout_ms: 0})
+    # Not remembered: good options work for the same bundle.
     assert {:ok, _} = JSEngine.snapshot_for(name, @bundle)
-    # forget_snapshot/1 clears the entry, so the failure is tried again.
-    JSEngine.forget_snapshot(name)
-    {retry_us, {:error, :timeout}} = :timer.tc(fn -> JSEngine.snapshot_for(name, spin, %{timeout_ms: 300}) end)
-    assert retry_us >= 300_000
   end
 
   test "concurrent first calls to snapshot_for/3 make one snapshot" do

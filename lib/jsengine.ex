@@ -135,6 +135,7 @@ defmodule JSEngine do
   #{@default_heap_mb}), the limits of the load that is snapshotted.
 
   Returns `{:ok, snapshot}` or `{:error, reason}`:
+    * `{:error, :badarg}`: `:timeout_ms` or `:heap_mb` is not a positive integer;
     * `{:error, {:js, msg}}`: the code throws, or leaves async work (a timer) pending at load;
     * `{:error, :timeout}`: the code runs past `:timeout_ms`;
     * `{:error, :oom}`: its heap grows past `:heap_mb`;
@@ -148,26 +149,36 @@ defmodule JSEngine do
   the code must not instantiate WebAssembly or register finalizers at load. asm.js is fine: V8
   runs with `--no-validate-asm`, so a `"use asm"` module is plain JavaScript.
   """
-  @spec create_snapshot(String.t(), String.t(), map()) :: {:ok, snapshot()} | {:error, failure()}
+  @spec create_snapshot(String.t(), String.t(), map()) :: {:ok, snapshot()} | {:error, failure() | :badarg}
   def create_snapshot(name, code, opts \\ %{}) when is_binary(name) and is_binary(code) and is_map(opts) do
-    timeout_ms = opts |> Map.get(:timeout_ms, @default_load_timeout_ms) |> min(@max_timeout_ms)
+    timeout_ms = Map.get(opts, :timeout_ms, @default_load_timeout_ms)
     heap_mb = Map.get(opts, :heap_mb, @default_heap_mb)
-    snapshot_create(name, code, timeout_ms, heap_mb)
+
+    if positive_integer?(timeout_ms) and positive_integer?(heap_mb),
+      do: snapshot_create(name, code, min(timeout_ms, @max_timeout_ms), heap_mb),
+      else: {:error, :badarg}
   end
+
+  defp positive_integer?(value), do: is_integer(value) and value > 0
 
   @doc """
   The snapshot of `code`, made once and kept in `:persistent_term` under `name` (options as for
   `create_snapshot/3`). The key is the SHA-256 of `code`.
 
-  Returns `{:ok, snapshot}` or `{:error, reason}` (the reasons of `create_snapshot/3`). The result
-  is remembered for that hash, a failure included: until `code` changes (or `forget_snapshot/1`),
-  later calls return the same `{:error, reason}` without trying again. A call with changed code
-  makes a new snapshot and replaces the entry.
+  Returns `{:ok, snapshot}` or `{:error, reason}` (the reasons of `create_snapshot/3`). A snapshot
+  and a deterministic failure (`{:error, {:js, msg}}`, `{:error, :oom}`) are remembered for that
+  hash: until `code` changes (or `forget_snapshot/1`), later calls return them without trying
+  again. Any other failure (`:timeout`, `{:panic, msg}`, `:dead`, `:badarg`) may be transient
+  (a loaded machine, a host fault, bad options) and is not remembered: the next call tries again.
+  A call with changed code makes a new snapshot and replaces the entry.
 
   Creation is serialised per `name` (a `:global` lock on this node): concurrent first calls make
-  one snapshot, and the others wait for it and return it.
+  one snapshot, and the others wait for it and return it. A waiter retries the lock after a random
+  sleep (`:global` backs off from up to 250 ms, doubling to 8 s), so it can wait longer than the
+  creation itself (about 70 ms for the aravis bundle). Make the snapshot once at boot, before
+  workspaces start, so that waiting is rare.
   """
-  @spec snapshot_for(String.t(), String.t(), map()) :: {:ok, snapshot()} | {:error, failure()}
+  @spec snapshot_for(String.t(), String.t(), map()) :: {:ok, snapshot()} | {:error, failure() | :badarg}
   def snapshot_for(name, code, opts \\ %{}) when is_binary(name) and is_binary(code) and is_map(opts) do
     key = {__MODULE__, :snapshot, name}
     sha = :crypto.hash(:sha256, code)
@@ -184,12 +195,17 @@ defmodule JSEngine do
 
             :miss ->
               result = create_snapshot(name, code, opts)
-              :persistent_term.put(key, {sha, result})
+              if remembered?(result), do: :persistent_term.put(key, {sha, result})
               result
           end
         end, [node()])
     end
   end
+
+  defp remembered?({:ok, _}), do: true
+  defp remembered?({:error, {:js, _}}), do: true
+  defp remembered?({:error, :oom}), do: true
+  defp remembered?(_), do: false
 
   defp cached(key, sha) do
     case :persistent_term.get(key, nil) do
