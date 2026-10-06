@@ -69,7 +69,7 @@ defmodule JSEngine do
   @doc false
   def isolate_cancel(_ticket), do: error()
   @doc false
-  def snapshot_create(_name, _code, _timeout_ms), do: error()
+  def snapshot_create(_name, _code, _timeout_ms, _heap_mb), do: error()
   @doc false
   def isolate_new_from_snapshot(_heap_mb, _snapshot), do: error()
   @doc "`%{bundle_sha256: hex, size: bytes, build_id: string}` of a snapshot."
@@ -97,15 +97,33 @@ defmodule JSEngine do
       Reaching the limit makes the running call return `{:error, :oom}`.
     * `:snapshot`, a snapshot from `create_snapshot/3` or `snapshot_for/3`:
       the isolate starts with that bundle already loaded (D54).
+
+  Returns `{:ok, isolate}` or `{:error, reason}`:
+    * `{:error, :badarg}`: `:snapshot` is given but is not a snapshot (`nil` included);
+    * `{:error, :oom}`: `:heap_mb` is too small to hold the snapshot (under
+      4 x its size), refused before V8 reads it;
+    * `{:error, {:panic, msg}}`: the isolate thread could not start.
+
+  There is no fallback here: an error is returned as is. A caller that wants
+  to load the bundle when no snapshot can be had (aravis `Bundle.start`)
+  does so itself.
   """
-  @spec create_isolate(map()) :: {:ok, isolate()} | {:error, failure()}
+  @spec create_isolate(map()) :: {:ok, isolate()} | {:error, failure() | :badarg}
   def create_isolate(opts \\ %{}) when is_map(opts) do
     heap_mb = Map.get(opts, :heap_mb, @default_heap_mb)
 
-    case Map.get(opts, :snapshot) do
-      nil -> isolate_new(heap_mb)
-      snapshot -> isolate_new_from_snapshot(heap_mb, snapshot)
+    case Map.fetch(opts, :snapshot) do
+      :error -> isolate_new(heap_mb)
+      {:ok, snapshot} when is_reference(snapshot) -> from_snapshot(heap_mb, snapshot)
+      {:ok, _} -> {:error, :badarg}
     end
+  end
+
+  # A reference that is not a snapshot resource fails the NIF's argument decoding.
+  defp from_snapshot(heap_mb, snapshot) do
+    isolate_new_from_snapshot(heap_mb, snapshot)
+  rescue
+    ArgumentError -> {:error, :badarg}
   end
 
   @doc """
@@ -113,37 +131,74 @@ defmodule JSEngine do
   An isolate created with `snapshot: snapshot` starts with `code` already loaded, without running
   its top-level code again. Every such isolate gets its own copy of the heap.
 
-  The snapshot is valid only in this OS process's NIF build. Refused with `{:error, {:js, msg}}`:
-  code that throws, and code that leaves async work (a timer) pending at load. Code that runs past
-  `timeout_ms` (default #{@default_load_timeout_ms}) is stopped: `{:error, :timeout}`.
+  Options: `:timeout_ms` (default #{@default_load_timeout_ms}) and `:heap_mb` (default
+  #{@default_heap_mb}), the limits of the load that is snapshotted.
+
+  Returns `{:ok, snapshot}` or `{:error, reason}`:
+    * `{:error, {:js, msg}}`: the code throws, or leaves async work (a timer) pending at load;
+    * `{:error, :timeout}`: the code runs past `:timeout_ms`;
+    * `{:error, :oom}`: its heap grows past `:heap_mb`;
+    * `{:error, {:panic, msg}}`: a host fault.
+
+  The snapshot is valid only in this OS process's NIF build.
+
+  **Bundles V8 cannot snapshot.** V8 aborts the whole OS process (no error is returned) when the
+  heap holds, at the end of the load, an exported WebAssembly function (a wasm instance made at
+  load) or a FinalizationRegistry with pending cleanup. jsengine cannot detect these cheaply, so
+  the code must not instantiate WebAssembly or register finalizers at load. asm.js is fine: V8
+  runs with `--no-validate-asm`, so a `"use asm"` module is plain JavaScript.
   """
-  @spec create_snapshot(String.t(), String.t(), pos_integer()) :: {:ok, snapshot()} | {:error, failure()}
-  def create_snapshot(name, code, timeout_ms \\ @default_load_timeout_ms)
-      when is_binary(name) and is_binary(code) and is_integer(timeout_ms) and timeout_ms > 0,
-      do: snapshot_create(name, code, min(timeout_ms, @max_timeout_ms))
+  @spec create_snapshot(String.t(), String.t(), map()) :: {:ok, snapshot()} | {:error, failure()}
+  def create_snapshot(name, code, opts \\ %{}) when is_binary(name) and is_binary(code) and is_map(opts) do
+    timeout_ms = opts |> Map.get(:timeout_ms, @default_load_timeout_ms) |> min(@max_timeout_ms)
+    heap_mb = Map.get(opts, :heap_mb, @default_heap_mb)
+    snapshot_create(name, code, timeout_ms, heap_mb)
+  end
 
   @doc """
-  The snapshot of `code`, made once and kept in `:persistent_term` under `name`. The key is the
-  SHA-256 of `code`: a call with changed code makes a new snapshot and replaces the old one.
+  The snapshot of `code`, made once and kept in `:persistent_term` under `name` (options as for
+  `create_snapshot/3`). The key is the SHA-256 of `code`.
+
+  Returns `{:ok, snapshot}` or `{:error, reason}` (the reasons of `create_snapshot/3`). The result
+  is remembered for that hash, a failure included: until `code` changes (or `forget_snapshot/1`),
+  later calls return the same `{:error, reason}` without trying again. A call with changed code
+  makes a new snapshot and replaces the entry.
+
+  Creation is serialised per `name` (a `:global` lock on this node): concurrent first calls make
+  one snapshot, and the others wait for it and return it.
   """
-  @spec snapshot_for(String.t(), String.t(), pos_integer()) :: {:ok, snapshot()} | {:error, failure()}
-  def snapshot_for(name, code, timeout_ms \\ @default_load_timeout_ms) when is_binary(name) and is_binary(code) do
+  @spec snapshot_for(String.t(), String.t(), map()) :: {:ok, snapshot()} | {:error, failure()}
+  def snapshot_for(name, code, opts \\ %{}) when is_binary(name) and is_binary(code) and is_map(opts) do
     key = {__MODULE__, :snapshot, name}
     sha = :crypto.hash(:sha256, code)
 
-    case :persistent_term.get(key, nil) do
-      {^sha, snapshot} ->
-        {:ok, snapshot}
+    case cached(key, sha) do
+      {:ok, result} ->
+        result
 
-      _ ->
-        with {:ok, snapshot} <- create_snapshot(name, code, timeout_ms) do
-          :persistent_term.put(key, {sha, snapshot})
-          {:ok, snapshot}
-        end
+      :miss ->
+        :global.trans({key, self()}, fn ->
+          case cached(key, sha) do
+            {:ok, result} ->
+              result
+
+            :miss ->
+              result = create_snapshot(name, code, opts)
+              :persistent_term.put(key, {sha, result})
+              result
+          end
+        end, [node()])
     end
   end
 
-  @doc "Drops the snapshot `snapshot_for/3` keeps under `name`."
+  defp cached(key, sha) do
+    case :persistent_term.get(key, nil) do
+      {^sha, result} -> {:ok, result}
+      _ -> :miss
+    end
+  end
+
+  @doc "Drops what `snapshot_for/3` keeps under `name` (a snapshot or a failure)."
   @spec forget_snapshot(String.t()) :: :ok
   def forget_snapshot(name) do
     :persistent_term.erase({__MODULE__, :snapshot, name})

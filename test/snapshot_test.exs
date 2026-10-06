@@ -101,12 +101,64 @@ defmodule JSEngine.SnapshotTest do
     assert msg =~ "at load"
     assert {:error, {:js, msg}} = JSEngine.create_snapshot("timer.js", "setTimeout(() => {}, 0);")
     assert msg =~ "pending"
-    assert {:error, :timeout} = JSEngine.create_snapshot("spin.js", "for (;;) {}", 200)
+    assert {:error, :timeout} = JSEngine.create_snapshot("spin.js", "for (;;) {}", %{timeout_ms: 200})
   end
 
-  # The first runtime of a process initialises V8. A snapshotting runtime would do it with
-  # `--predictable --random-seed=42`, for every isolate of the BEAM (the same Math.random sequence
-  # everywhere). Needs a fresh OS process, where the snapshot is the first runtime.
+  test "a bundle that allocates without bound at load is {:error, :oom}, and the BEAM lives on" do
+    hog = "const hoard = []; for (;;) hoard.push(new Array(100000).fill(1.5));"
+    assert {:error, :oom} = JSEngine.create_snapshot("hog.js", hog, %{heap_mb: 64})
+    assert {:ok, "332833500"} = JSEngine.call(isolate!(%{snapshot: snapshot!()}), "sum", "[]", 5_000)
+  end
+
+  test "snapshot_for/3 remembers a failure until the bundle changes" do
+    name = "failing-#{System.unique_integer([:positive])}.js"
+    on_exit(fn -> JSEngine.forget_snapshot(name) end)
+    spin = "for (;;) {}"
+
+    {first_us, first} = :timer.tc(fn -> JSEngine.snapshot_for(name, spin, %{timeout_ms: 300}) end)
+    assert first == {:error, :timeout}
+    assert first_us >= 300_000
+
+    # Not tried again: the same error at once.
+    {again_us, again} = :timer.tc(fn -> JSEngine.snapshot_for(name, spin, %{timeout_ms: 300}) end)
+    assert again == {:error, :timeout}
+    assert again_us < 100_000, "retried: #{again_us} us"
+
+    # A changed bundle is a new key and is tried.
+    assert {:ok, _} = JSEngine.snapshot_for(name, @bundle)
+    # forget_snapshot/1 clears the entry, so the failure is tried again.
+    JSEngine.forget_snapshot(name)
+    {retry_us, {:error, :timeout}} = :timer.tc(fn -> JSEngine.snapshot_for(name, spin, %{timeout_ms: 300}) end)
+    assert retry_us >= 300_000
+  end
+
+  test "concurrent first calls to snapshot_for/3 make one snapshot" do
+    name = "race-#{System.unique_integer([:positive])}.js"
+    on_exit(fn -> JSEngine.forget_snapshot(name) end)
+
+    results =
+      1..8
+      |> Task.async_stream(fn _ -> JSEngine.snapshot_for(name, @bundle) end, max_concurrency: 8, timeout: 30_000)
+      |> Enum.map(fn {:ok, {:ok, snapshot}} -> snapshot end)
+
+    assert length(Enum.uniq(results)) == 1
+  end
+
+  test "create_isolate/1 refuses a snapshot option that is not a snapshot, or a heap too small for it" do
+    assert {:error, :badarg} = JSEngine.create_isolate(%{snapshot: nil})
+    assert {:error, :badarg} = JSEngine.create_isolate(%{snapshot: "bundle"})
+    assert {:error, :badarg} = JSEngine.create_isolate(%{snapshot: make_ref()})
+
+    {:ok, big} = JSEngine.create_snapshot("big.js", "globalThis.big = Array.from({ length: 2000000 }, (_, i) => i);")
+    assert JSEngine.snapshot_info(big).size * 4 > 16 * 1024 * 1024
+    assert {:error, :oom} = JSEngine.create_isolate(%{heap_mb: 16, snapshot: big})
+  end
+
+  # THE GUARD FOR THE PREDICTABLE-MODE TRAP (the Rust Math.random check is not one: another test
+  # may have initialised V8 first). The first runtime of a process initialises V8. A snapshotting
+  # runtime would do it with `--predictable --random-seed=42`, for every isolate of the BEAM (the
+  # same Math.random sequence everywhere). Needs a fresh OS process, where the snapshot is the
+  # first runtime.
   @tag timeout: 120_000
   test "a snapshot made before any isolate leaves V8 in its normal mode" do
     script = """

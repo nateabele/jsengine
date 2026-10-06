@@ -14,12 +14,24 @@
 //! the build id of this NIF, and `from_bytes` refuses another build's bytes
 //! (V8 aborts the process on a snapshot it cannot read, so this check must
 //! come first).
+//!
+//! V8 cannot serialise every heap, and it aborts the process (it does not
+//! return an error) when it meets one of these at snapshot time:
+//!   * an exported WebAssembly function (a wasm instance made at load);
+//!   * a FinalizationRegistry with pending cleanup (a registered target that
+//!     was collected during the load).
+//!
+//! Neither can be detected cheaply before serialising, so a bundle given to
+//! `create` must not instantiate WebAssembly or register finalizers at load.
+//! asm.js is safe: deno_core runs V8 with `--no-validate-asm`, so an
+//! `"use asm"` module is plain JavaScript (tested).
 
 use crate::engine::{bootstrap, host_extensions};
 use crate::isolate::{panic_message, script_name, Failure};
 use deno_core::futures::task::noop_waker;
 use deno_core::{v8, FastString, JsRuntime, JsRuntimeForSnapshot, RuntimeOptions};
 use sha2::{Digest, Sha256};
+use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::mpsc::channel;
@@ -138,16 +150,25 @@ pub fn bundle_sha256(code: &str) -> [u8; 32] {
 /// Refused (`Js`): a script that throws, and a script that leaves async work
 /// pending (a timer or an op started at load): a snapshot cannot carry it,
 /// so an isolate started from it would differ from one that loaded the code.
-/// A script that runs past `timeout` is stopped (`Timeout`).
-pub fn create(name: &str, code: String, timeout: Duration) -> Result<StartupSnapshot, Failure> {
+/// A script that runs past `timeout` is stopped (`Timeout`); one whose heap
+/// grows past `heap_mb` MiB is stopped (`Oom`). See the module doc for the
+/// bundles V8 cannot snapshot at all.
+pub fn create(
+    name: &str,
+    code: String,
+    timeout: Duration,
+    heap_mb: usize,
+) -> Result<StartupSnapshot, Failure> {
     let name = script_name(name);
     let (tx, rx) = channel();
     std::thread::Builder::new()
         .name("jsengine-snapshot".into())
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
-            let result = catch_unwind(AssertUnwindSafe(|| snapshot_thread(name, code, timeout)))
-                .unwrap_or_else(|payload| Err(Failure::Panic(panic_message(&*payload))));
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                snapshot_thread(name, code, timeout, heap_mb)
+            }))
+            .unwrap_or_else(|payload| Err(Failure::Panic(panic_message(&*payload))));
             let _ = tx.send(result);
         })
         .map_err(|e| Failure::Panic(format!("cannot spawn snapshot thread: {e}")))?;
@@ -162,6 +183,7 @@ fn snapshot_thread(
     name: &'static str,
     code: String,
     timeout: Duration,
+    heap_mb: usize,
 ) -> Result<StartupSnapshot, Failure> {
     // The first runtime of a process initialises V8, and a snapshotting one
     // would do it with `--predictable --random-seed=42` for the whole BEAM
@@ -184,6 +206,24 @@ fn snapshot_thread(
     bootstrap(&mut runtime)
         .map_err(|e| Failure::Panic(format!("cannot start the runtime: {e}")))?;
 
+    // Heap cap. deno_core ignores `create_params` for a snapshotting runtime,
+    // so V8 would only stop at its default limit, with a fatal OOM that ends
+    // the BEAM. A GC prologue callback stops the script once the heap passes
+    // `heap_mb`; the near-heap-limit callback is the backstop at V8's own
+    // limit. Both terminate execution and the result is `Oom`.
+    let guard = Box::new(HeapGuard {
+        cap_bytes: heap_mb.max(16).saturating_mul(1024 * 1024),
+        handle: runtime.v8_isolate().thread_safe_handle(),
+        oom: AtomicBool::new(false),
+    });
+    let guard_ptr = &*guard as *const HeapGuard as *mut c_void;
+    runtime
+        .v8_isolate()
+        .add_gc_prologue_callback(heap_guard_on_gc, guard_ptr, v8::GCType::ALL);
+    runtime
+        .v8_isolate()
+        .add_near_heap_limit_callback(heap_guard_near_limit, guard_ptr);
+
     // Deadline: the snapshotting isolate is not a hardened one, so it gets a
     // timer of its own.
     let handle = runtime.v8_isolate().thread_safe_handle();
@@ -205,7 +245,9 @@ fn snapshot_thread(
     let _ = done_tx.send(());
     let _ = timer.join();
 
-    let failure = if timed_out.load(SeqCst) {
+    let failure = if guard.oom.load(SeqCst) {
+        Some(Failure::Oom)
+    } else if timed_out.load(SeqCst) {
         Some(Failure::Timeout)
     } else {
         loaded.err().map(Failure::Js)
@@ -213,9 +255,17 @@ fn snapshot_thread(
     if failure.is_some() {
         runtime.v8_isolate().cancel_terminate_execution();
     }
+    // The callbacks point at `guard`: remove them before the runtime goes.
+    runtime
+        .v8_isolate()
+        .remove_gc_prologue_callback(heap_guard_on_gc, guard_ptr);
+    runtime
+        .v8_isolate()
+        .remove_near_heap_limit_callback(heap_guard_near_limit, 0);
     // Always consume the runtime through `snapshot`: dropping a snapshotting
     // runtime leaks its isolate.
     let blob = runtime.snapshot();
+    drop(guard);
     match failure {
         Some(failure) => Err(failure),
         None => Ok(StartupSnapshot {
@@ -223,6 +273,49 @@ fn snapshot_thread(
             blob: Arc::from(&*blob),
         }),
     }
+}
+
+/// The heap cap of a snapshotting isolate (see `snapshot_thread`).
+struct HeapGuard {
+    cap_bytes: usize,
+    handle: v8::IsolateHandle,
+    oom: AtomicBool,
+}
+
+impl HeapGuard {
+    fn trip(&self) {
+        self.oom.store(true, SeqCst);
+        self.handle.terminate_execution();
+    }
+}
+
+// V8 calls these from extern "C" frames, where an unwinding panic aborts the
+// process: the bodies cannot panic, and catch_unwind makes sure.
+extern "C" fn heap_guard_on_gc(
+    isolate: *mut v8::Isolate,
+    _type: v8::GCType,
+    _flags: v8::GCCallbackFlags,
+    data: *mut c_void,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: `data` is the HeapGuard that outlives the registration, and
+        // V8 passes the isolate it runs this callback on.
+        let (guard, isolate) = unsafe { (&*(data as *const HeapGuard), &mut *isolate) };
+        let mut stats = v8::HeapStatistics::default();
+        isolate.get_heap_statistics(&mut stats);
+        if stats.used_heap_size() > guard.cap_bytes {
+            guard.trip();
+        }
+    }));
+}
+
+extern "C" fn heap_guard_near_limit(data: *mut c_void, current: usize, _initial: usize) -> usize {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: as above.
+        unsafe { &*(data as *const HeapGuard) }.trip();
+    }));
+    // Headroom so V8 can unwind the terminated script instead of aborting.
+    current.saturating_mul(2)
 }
 
 /// Polls the event loop once: nothing may be left to run.

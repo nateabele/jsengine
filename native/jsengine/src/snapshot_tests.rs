@@ -6,6 +6,7 @@ use crate::isolate::{Isolate, Reply};
 use std::time::Instant;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+const HEAP_MB: usize = 64;
 
 /// A bundle with top-level state: a table built at load, a load counter and a
 /// mutable global.
@@ -22,7 +23,7 @@ globalThis.later = (v) => new Promise((r) => setTimeout(() => r(v), 5));
 "#;
 
 fn snapshot_of(code: &str) -> Arc<StartupSnapshot> {
-    Arc::new(create("bundle.js", code.to_string(), TIMEOUT).expect("snapshot"))
+    Arc::new(create("bundle.js", code.to_string(), TIMEOUT, HEAP_MB).expect("snapshot"))
 }
 
 #[test]
@@ -122,7 +123,7 @@ fn a_changed_bundle_has_another_key() {
 }
 
 #[test]
-fn isolates_started_from_one_snapshot_share_no_state() {
+fn isolates_started_from_one_snapshot_share_no_state_or_random_sequence() {
     let snapshot = snapshot_of(BUNDLE);
     let a = Isolate::spawn_from(64, Some(snapshot.clone())).expect("spawn a");
     assert_eq!(call(&a, "bump", "[]", TIMEOUT), Reply::Value("1".into()));
@@ -142,7 +143,9 @@ fn isolates_started_from_one_snapshot_share_no_state() {
         call(&a, "state", "[]", TIMEOUT),
         Reply::Value(r#"{"loads":1,"counter":2,"stray":"from a"}"#.into())
     );
-    // Math.random is not replayed from the snapshot: each isolate has its own seed.
+    // Each isolate draws its own Math.random sequence (V8 resets the cache at
+    // serialisation). This does not guard the predictable-mode trap: another
+    // test may have initialised V8 first. The fresh-process Elixir test does.
     let ra = call(&a, "rand", "[]", TIMEOUT);
     let rb = call(&b, "rand", "[]", TIMEOUT);
     let rc = call(
@@ -158,11 +161,12 @@ fn isolates_started_from_one_snapshot_share_no_state() {
 }
 
 #[test]
-fn an_isolate_outlives_the_last_outside_reference_to_its_snapshot() {
+fn an_isolate_keeps_working_after_the_caller_drops_its_snapshot() {
+    // Shows the isolate thread holds its own reference. V8 does not read the
+    // blob after start, so this cannot show the blob's lifetime is right;
+    // that rests on the drop order in `isolate_thread`.
     let snapshot = snapshot_of(BUNDLE);
     let isolate = Isolate::spawn_from(64, Some(snapshot)).expect("spawn");
-    // The isolate thread holds the only reference now; force a GC so V8
-    // touches the heap it deserialised from the blob.
     load(&isolate, "globalThis.churn = () => { let a = []; for (let i = 0; i < 200000; i++) a.push({ i }); return a.length; };");
     assert_eq!(
         call(&isolate, "churn", "[]", TIMEOUT),
@@ -171,6 +175,26 @@ fn an_isolate_outlives_the_last_outside_reference_to_its_snapshot() {
     assert_eq!(
         call(&isolate, "sum", "[]", TIMEOUT),
         Reply::Value("332833500".into())
+    );
+}
+
+#[test]
+fn a_heap_too_small_for_the_snapshot_is_refused_before_v8_reads_it() {
+    let big = "globalThis.big = Array.from({ length: 2000000 }, (_, i) => i); globalThis.len = () => big.length;";
+    let snapshot = snapshot_of(big);
+    assert!(
+        snapshot.size() * 4 > 16 * 1024 * 1024,
+        "{}",
+        snapshot.size()
+    );
+    assert!(matches!(
+        Isolate::spawn_from(16, Some(snapshot.clone())),
+        Err(Failure::Oom)
+    ));
+    let roomy = Isolate::spawn_from(256, Some(snapshot)).expect("spawn");
+    assert_eq!(
+        call(&roomy, "len", "[]", TIMEOUT),
+        Reply::Value("2000000".into())
     );
 }
 
@@ -212,11 +236,21 @@ fn a_snapshot_isolate_keeps_the_heap_limit_and_the_deadline() {
 
 #[test]
 fn a_bundle_that_throws_or_leaves_async_work_is_refused() {
-    match create("bad.js", "throw new Error('at load');".into(), TIMEOUT) {
+    match create(
+        "bad.js",
+        "throw new Error('at load');".into(),
+        TIMEOUT,
+        HEAP_MB,
+    ) {
         Err(Failure::Js(message)) => assert!(message.contains("at load"), "{message}"),
         other => panic!("expected a JS failure, got {:?}", other.map(|s| s.size())),
     }
-    match create("timer.js", "setTimeout(() => {}, 0);".into(), TIMEOUT) {
+    match create(
+        "timer.js",
+        "setTimeout(() => {}, 0);".into(),
+        TIMEOUT,
+        HEAP_MB,
+    ) {
         Err(Failure::Js(message)) => assert!(message.contains("pending"), "{message}"),
         other => panic!("expected a JS failure, got {:?}", other.map(|s| s.size())),
     }
@@ -225,11 +259,55 @@ fn a_bundle_that_throws_or_leaves_async_work_is_refused() {
 #[test]
 fn a_spinning_bundle_times_out() {
     let started = Instant::now();
-    match create("spin.js", "for (;;) {}".into(), Duration::from_millis(200)) {
+    match create(
+        "spin.js",
+        "for (;;) {}".into(),
+        Duration::from_millis(200),
+        HEAP_MB,
+    ) {
         Err(Failure::Timeout) => {}
         other => panic!("expected a timeout, got {:?}", other.map(|s| s.size())),
     }
     assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn a_bundle_that_allocates_without_bound_at_load_is_oom_not_an_abort() {
+    let started = Instant::now();
+    let hog = "const hoard = []; for (;;) hoard.push(new Array(100000).fill(1.5));";
+    match create("hog.js", hog.into(), Duration::from_secs(60), HEAP_MB) {
+        Err(Failure::Oom) => {}
+        other => panic!("expected an OOM, got {:?}", other.map(|s| s.size())),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    // The process is fine, and so is the next snapshot.
+    let snapshot = snapshot_of(BUNDLE);
+    let isolate = Isolate::spawn_from(64, Some(snapshot)).expect("spawn");
+    assert_eq!(
+        call(&isolate, "sum", "[]", TIMEOUT),
+        Reply::Value("332833500".into())
+    );
+}
+
+#[test]
+fn an_asm_js_module_at_load_is_plain_javascript_and_snapshots() {
+    // V8 cannot serialise validated asm.js; deno_core's --no-validate-asm
+    // means it is never validated.
+    let code = r#"
+        function Mod(stdlib) { "use asm"; function f(x) { x = x | 0; return (x + 1) | 0; } return { f: f }; }
+        var m = Mod(globalThis);
+        globalThis.inc = (x) => m.f(x);
+    "#;
+    let snapshot = snapshot_of(code);
+    let isolate = Isolate::spawn_from(64, Some(snapshot)).expect("spawn");
+    assert_eq!(
+        call(&isolate, "inc", "[41]", TIMEOUT),
+        Reply::Value("42".into())
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -289,10 +367,6 @@ fn real_bundle_equivalence_and_timings() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(15);
 
-    // Diagnostics only: extra V8 flags for this test process (e.g. --single-threaded).
-    if let Ok(flags) = std::env::var("JSENGINE_D54_V8_FLAGS") {
-        v8::V8::set_flags_from_string(&flags);
-    }
     // Warm-up: V8 platform, page cache.
     let warm = Isolate::spawn(256).unwrap();
     assert_eq!(load(&warm, &code), Reply::Loaded);
@@ -305,6 +379,7 @@ fn real_bundle_equivalence_and_timings() {
             "server-interop.min.js",
             code.clone(),
             Duration::from_secs(30),
+            256,
         )
         .expect("snapshot"),
     );
@@ -406,6 +481,7 @@ fn real_bundle_heap_after_start() {
         "server-interop.min.js",
         code.clone(),
         Duration::from_secs(30),
+        256,
     )
     .expect("snapshot");
     let _platform = tokio::runtime::Builder::new_current_thread()

@@ -242,6 +242,15 @@ fn start(heap_mb: usize, snapshot: Option<&StartupSnapshot>) -> Result<Parts, Fa
         .build()
         .map_err(|e| Failure::Panic(format!("cannot build tokio runtime: {e}")))?;
     let heap_bytes = heap_mb.max(16).saturating_mul(1024 * 1024);
+    // deno_core deserialises the snapshot inside `JsRuntime::new`, before a
+    // near-heap-limit callback can be installed, so a heap too small for the
+    // snapshot would be a fatal V8 OOM. Refuse it up front instead (the heap
+    // after a start is about 1.5x the blob).
+    if let Some(snapshot) = snapshot {
+        if heap_bytes < snapshot.size().saturating_mul(4) {
+            return Err(Failure::Oom);
+        }
+    }
     let params = v8::CreateParams::default().heap_limits(0, heap_bytes);
     let mut runtime = {
         let _enter = tokio_rt.enter();

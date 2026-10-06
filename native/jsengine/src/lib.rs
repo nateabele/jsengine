@@ -239,7 +239,8 @@ fn queued<'a>(
     }
 }
 
-#[rustler::nif(schedule = "DirtyCpu")]
+// DirtyIo: waits (`recv`) for the isolate thread to build its runtime.
+#[rustler::nif(schedule = "DirtyIo")]
 fn isolate_new(env: Env, heap_mb: u64) -> Term {
     guard(env, || match Isolate::spawn(heap_mb as usize) {
         Ok(isolate) => (atoms::ok(), ResourceArc::new(IsolateResource(isolate))).encode(env),
@@ -351,11 +352,12 @@ fn isolate_test_stall<'a>(
 
 /// Runs `code` once and snapshots the heap. Blocks a dirty scheduler for
 /// about as long as a load of `code` plus the serialisation.
-#[rustler::nif(schedule = "DirtyCpu")]
-fn snapshot_create(env: Env, name: String, code: String, timeout_ms: u64) -> Term {
+// DirtyIo: the scheduler thread waits on the snapshot thread (`recv`).
+#[rustler::nif(schedule = "DirtyIo")]
+fn snapshot_create(env: Env, name: String, code: String, timeout_ms: u64, heap_mb: u64) -> Term {
     guard(env, || {
         let timeout = Duration::from_millis(timeout_ms).min(isolate::MAX_TIMEOUT);
-        match snapshot::create(&name, code, timeout) {
+        match snapshot::create(&name, code, timeout, heap_mb as usize) {
             Ok(snapshot) => (
                 atoms::ok(),
                 ResourceArc::new(SnapshotResource(Arc::new(snapshot))),
@@ -414,7 +416,8 @@ fn snapshot_from_binary<'a>(env: Env<'a>, bytes: Binary<'a>) -> Term<'a> {
     })
 }
 
-#[rustler::nif(schedule = "DirtyCpu")]
+// DirtyIo: waits (`recv`) for the isolate thread to build its runtime.
+#[rustler::nif(schedule = "DirtyIo")]
 fn isolate_new_from_snapshot(
     env: Env,
     heap_mb: u64,
