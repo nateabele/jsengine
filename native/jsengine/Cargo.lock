@@ -603,11 +603,13 @@ dependencies = [
  "deno_ast",
  "deno_core",
  "lazy_static",
+ "libc",
  "once_cell",
  "quick-error",
  "rustler",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 
@@ -1143,6 +1145,17 @@ name = "sha-1"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "028f48d513f9678cda28f6e4064755b3fbb2af6acd672f2c209b62323f7aea0f"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
  "cpufeatures",

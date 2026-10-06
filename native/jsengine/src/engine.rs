@@ -5,7 +5,7 @@ use deno_core::error::AnyError;
 use deno_core::serde_json::Value;
 use deno_core::{
     anyhow, op2, serde_v8, v8, Extension, FastString, FsModuleLoader, JsRuntime, ModuleCode,
-    ModuleSpecifier, Op, RuntimeOptions,
+    ModuleSpecifier, Op, RuntimeOptions, Snapshot,
 };
 use crate::isolate::panic_message;
 use deno_core::futures::FutureExt;
@@ -54,23 +54,44 @@ fn transpile_typescript(code: &str, specifier: &str) -> Result<String, String> {
     Ok(transpiled.text)
 }
 
+/// The jsengine host extension (the ops behind `setTimeout`). A startup
+/// snapshot and every runtime started from it must register exactly this
+/// list, in this order: V8 resolves the op functions a snapshot refers to by
+/// their index among the external references (D54).
+pub(crate) fn host_extensions() -> Vec<Extension> {
+    vec![Extension {
+        name: "core:apis",
+        ops: std::borrow::Cow::Borrowed(&[op_set_timeout::DECL]),
+        ..Default::default()
+    }]
+}
+
+/// Installs the host APIs (console, setTimeout) in a fresh context. A runtime
+/// started from a snapshot already has them.
+pub(crate) fn bootstrap(runtime: &mut JsRuntime) -> Result<(), anyhow::Error> {
+    runtime.execute_script_static("[core:runtime]", include_str!("./runtime.js"))?;
+    Ok(())
+}
+
 /// Builds a JsRuntime with the jsengine host APIs (console, setTimeout).
 /// `create_params` carries the heap limits of a hardened isolate; the legacy
-/// engine passes `None`.
+/// engine passes `None`. With `snapshot`, the runtime starts from that V8
+/// startup snapshot (D54) instead of a pristine context.
 pub(crate) fn new_runtime(
     create_params: Option<v8::CreateParams>,
+    snapshot: Option<Snapshot>,
 ) -> Result<JsRuntime, anyhow::Error> {
+    let from_snapshot = snapshot.is_some();
     let mut runtime = JsRuntime::new(RuntimeOptions {
         module_loader: Some(Rc::new(FsModuleLoader)),
         create_params,
-        extensions: vec![Extension {
-            name: "core:apis",
-            ops: std::borrow::Cow::Borrowed(&[op_set_timeout::DECL]),
-            ..Default::default()
-        }],
+        startup_snapshot: snapshot,
+        extensions: host_extensions(),
         ..Default::default()
     });
-    runtime.execute_script_static("[core:runtime]", include_str!("./runtime.js"))?;
+    if !from_snapshot {
+        bootstrap(&mut runtime)?;
+    }
     Ok(runtime)
 }
 
@@ -149,7 +170,7 @@ impl EngineManager {
 
 impl Engine {
     pub fn new() -> Self {
-        match new_runtime(None) {
+        match new_runtime(None, None) {
             Ok(runtime) => Engine { runtime },
             Err(e) => panic!("Failed to initialize JavaScript runtime: {:?}", e),
         }

@@ -7,6 +7,10 @@ defmodule JSEngine do
     * **Isolates** (`create_isolate/1`, `load_source/3`, `call/4`, `destroy/1`):
       one OS thread per isolate, a heap limit, a deadline per call, and a
       structured error for every host failure. Use this API.
+    * **Startup snapshots** (`create_snapshot/3`, `snapshot_for/3`): load a
+      bundle once, snapshot the V8 heap, and start isolates from it with
+      `create_isolate(%{snapshot: snapshot})`, so the bundle's top-level code
+      never runs again (D54). A snapshot is valid only for this NIF build.
     * **Environments** (`create_env/0`, `load/2`, `run/2`, `call/3`, ...): the
       original API. All environments share one engine thread. Deprecated; it
       stays until the Aravis server has moved to isolates.
@@ -25,6 +29,9 @@ defmodule JSEngine do
 
   @typedoc "A V8 isolate on its own OS thread (an opaque NIF resource)."
   @type isolate :: reference()
+
+  @typedoc "A V8 startup snapshot of a loaded bundle (an opaque NIF resource, D54)."
+  @type snapshot :: reference()
 
   @type failure ::
           :timeout | :oom | {:panic, String.t()} | {:js, String.t()} | :dead
@@ -61,17 +68,86 @@ defmodule JSEngine do
   def isolate_test_stall(_isolate, _stall_ms, _timeout_ms, _tag), do: error()
   @doc false
   def isolate_cancel(_ticket), do: error()
+  @doc false
+  def snapshot_create(_name, _code, _timeout_ms), do: error()
+  @doc false
+  def isolate_new_from_snapshot(_heap_mb, _snapshot), do: error()
+  @doc "`%{bundle_sha256: hex, size: bytes, build_id: string}` of a snapshot."
+  @spec snapshot_info(snapshot()) :: %{bundle_sha256: String.t(), size: non_neg_integer(), build_id: String.t()}
+  def snapshot_info(_snapshot), do: error()
+  @doc """
+  The snapshot as a binary for a cache. It is stamped with the build id of this NIF: only the same
+  binary reads it back.
+  """
+  @spec snapshot_to_binary(snapshot()) :: {:ok, binary()} | {:error, failure()}
+  def snapshot_to_binary(_snapshot), do: error()
+  @doc """
+  Reads a binary written by `snapshot_to_binary/1`. `{:error, :stale}`: another build of jsengine
+  wrote it (make the snapshot again). `{:error, :corrupt}`: not a snapshot, or damaged. V8 never sees
+  refused bytes (it aborts the process on a snapshot it cannot read).
+  """
+  @spec snapshot_from_binary(binary()) :: {:ok, snapshot()} | {:error, :stale | :corrupt}
+  def snapshot_from_binary(_binary), do: error()
 
   @doc """
   Starts an isolate on its own OS thread.
 
-  Options: `:heap_mb`, the V8 heap limit in MiB (default #{@default_heap_mb}).
-  Reaching the limit makes the running call return `{:error, :oom}`.
+  Options:
+    * `:heap_mb`, the V8 heap limit in MiB (default #{@default_heap_mb}).
+      Reaching the limit makes the running call return `{:error, :oom}`.
+    * `:snapshot`, a snapshot from `create_snapshot/3` or `snapshot_for/3`:
+      the isolate starts with that bundle already loaded (D54).
   """
   @spec create_isolate(map()) :: {:ok, isolate()} | {:error, failure()}
   def create_isolate(opts \\ %{}) when is_map(opts) do
     heap_mb = Map.get(opts, :heap_mb, @default_heap_mb)
-    isolate_new(heap_mb)
+
+    case Map.get(opts, :snapshot) do
+      nil -> isolate_new(heap_mb)
+      snapshot -> isolate_new_from_snapshot(heap_mb, snapshot)
+    end
+  end
+
+  @doc """
+  Loads `code` once, as `load_source/3` would, and takes a V8 startup snapshot of the heap (D54).
+  An isolate created with `snapshot: snapshot` starts with `code` already loaded, without running
+  its top-level code again. Every such isolate gets its own copy of the heap.
+
+  The snapshot is valid only in this OS process's NIF build. Refused with `{:error, {:js, msg}}`:
+  code that throws, and code that leaves async work (a timer) pending at load. Code that runs past
+  `timeout_ms` (default #{@default_load_timeout_ms}) is stopped: `{:error, :timeout}`.
+  """
+  @spec create_snapshot(String.t(), String.t(), pos_integer()) :: {:ok, snapshot()} | {:error, failure()}
+  def create_snapshot(name, code, timeout_ms \\ @default_load_timeout_ms)
+      when is_binary(name) and is_binary(code) and is_integer(timeout_ms) and timeout_ms > 0,
+      do: snapshot_create(name, code, min(timeout_ms, @max_timeout_ms))
+
+  @doc """
+  The snapshot of `code`, made once and kept in `:persistent_term` under `name`. The key is the
+  SHA-256 of `code`: a call with changed code makes a new snapshot and replaces the old one.
+  """
+  @spec snapshot_for(String.t(), String.t(), pos_integer()) :: {:ok, snapshot()} | {:error, failure()}
+  def snapshot_for(name, code, timeout_ms \\ @default_load_timeout_ms) when is_binary(name) and is_binary(code) do
+    key = {__MODULE__, :snapshot, name}
+    sha = :crypto.hash(:sha256, code)
+
+    case :persistent_term.get(key, nil) do
+      {^sha, snapshot} ->
+        {:ok, snapshot}
+
+      _ ->
+        with {:ok, snapshot} <- create_snapshot(name, code, timeout_ms) do
+          :persistent_term.put(key, {sha, snapshot})
+          {:ok, snapshot}
+        end
+    end
+  end
+
+  @doc "Drops the snapshot `snapshot_for/3` keeps under `name`."
+  @spec forget_snapshot(String.t()) :: :ok
+  def forget_snapshot(name) do
+    :persistent_term.erase({__MODULE__, :snapshot, name})
+    :ok
   end
 
   @doc """

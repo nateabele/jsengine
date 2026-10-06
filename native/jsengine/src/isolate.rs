@@ -7,6 +7,7 @@
 //! creates a new isolate to recover.
 
 use crate::engine::new_runtime;
+use crate::snapshot::StartupSnapshot;
 use crate::watchdog;
 use deno_core::error::JsError;
 use deno_core::{v8, FastString, JsRuntime};
@@ -128,6 +129,15 @@ impl Isolate {
     /// Starts a new isolate thread with a heap limit of `heap_mb` MiB and
     /// waits until its runtime exists.
     pub fn spawn(heap_mb: usize) -> Result<Isolate, Failure> {
+        Isolate::spawn_from(heap_mb, None)
+    }
+
+    /// Like `spawn`, but with `snapshot` the isolate starts from that startup
+    /// snapshot (D54): the bundle it was made from is already loaded.
+    pub fn spawn_from(
+        heap_mb: usize,
+        snapshot: Option<Arc<StartupSnapshot>>,
+    ) -> Result<Isolate, Failure> {
         let (sender, receiver) = channel::<Command>();
         let (ready_tx, ready_rx) = channel::<Result<Arc<Shared>, Failure>>();
         let slot = Arc::new(Mutex::new(Some(sender)));
@@ -135,7 +145,7 @@ impl Isolate {
         std::thread::Builder::new()
             .name("jsengine-isolate".into())
             .stack_size(8 * 1024 * 1024)
-            .spawn(move || isolate_thread(heap_mb, receiver, ready_tx, thread_slot))
+            .spawn(move || isolate_thread(heap_mb, snapshot, receiver, ready_tx, thread_slot))
             .map_err(|e| Failure::Panic(format!("cannot spawn isolate thread: {e}")))?;
         match ready_rx.recv() {
             Ok(Ok(shared)) => Ok(Isolate {
@@ -224,7 +234,9 @@ fn split(command: Command) -> Result<(ReplyFn, Duration, Job), Option<Sender<()>
 
 type Parts = (JsRuntime, Arc<Shared>, tokio::runtime::Runtime);
 
-fn start(heap_mb: usize) -> Result<Parts, Failure> {
+/// `snapshot` must outlive the runtime this returns (`isolate_thread` holds it
+/// until after the runtime is dropped).
+fn start(heap_mb: usize, snapshot: Option<&StartupSnapshot>) -> Result<Parts, Failure> {
     let tokio_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -235,7 +247,9 @@ fn start(heap_mb: usize) -> Result<Parts, Failure> {
         let _enter = tokio_rt.enter();
         // The runtime bootstrap is jsengine's own code, not the caller's:
         // a failure here is a host fault.
-        new_runtime(Some(params))
+        // SAFETY: the caller keeps `snapshot` alive until the runtime is dropped.
+        let startup = snapshot.map(|s| unsafe { s.startup_data() });
+        new_runtime(Some(params), startup)
             .map_err(|e| Failure::Panic(format!("cannot start the runtime: {e}")))?
     };
     let handle = runtime.v8_isolate().thread_safe_handle();
@@ -263,11 +277,14 @@ fn start(heap_mb: usize) -> Result<Parts, Failure> {
 
 fn isolate_thread(
     heap_mb: usize,
+    // V8 reads the snapshot blob for the life of the runtime: held here, it
+    // is dropped only when the thread ends, after the runtime.
+    snapshot: Option<Arc<StartupSnapshot>>,
     receiver: Receiver<Command>,
     ready: Sender<Result<Arc<Shared>, Failure>>,
     slot: Arc<Mutex<Option<Sender<Command>>>>,
 ) {
-    let (mut runtime, shared, tokio_rt) = match catch_unwind(AssertUnwindSafe(|| start(heap_mb))) {
+    let (mut runtime, shared, tokio_rt) = match catch_unwind(AssertUnwindSafe(|| start(heap_mb, snapshot.as_deref()))) {
         Ok(Ok(parts)) => parts,
         Ok(Err(failure)) => {
             let _ = ready.send(Err(failure));
@@ -401,7 +418,7 @@ static SCRIPT_NAMES: Lazy<Mutex<HashSet<&'static str>>> = Lazy::new(|| Mutex::ne
 
 /// deno_core wants a `&'static str` ASCII script name. Names are interned,
 /// so loading the same bundle name again leaks nothing new.
-fn script_name(name: &str) -> &'static str {
+pub(crate) fn script_name(name: &str) -> &'static str {
     let ascii: String = name
         .chars()
         .map(|c| if c.is_ascii() && !c.is_ascii_control() { c } else { '_' })
@@ -482,4 +499,4 @@ async fn call_function(
 
 #[cfg(test)]
 #[path = "isolate_tests.rs"]
-mod tests;
+pub(crate) mod tests;

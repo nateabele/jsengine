@@ -4,16 +4,18 @@ mod conv;
 mod engine;
 mod error;
 mod isolate;
+mod snapshot;
 mod watchdog;
 
 use crate::conv::{json_to_term, term_to_json};
 use crate::engine::Request::{Call, CreateEnv, DestroyEnv, Load, Run};
 use crate::engine::{EngineManager, EnvId, Request, Response};
 use crate::isolate::{panic_message, Command, Failure, Isolate, Reply, ReplyFn};
+use crate::snapshot::{Refused, StartupSnapshot};
 
 use deno_core::serde_json::Value;
 use rustler::env::OwnedEnv;
-use rustler::{Encoder, Env, Error, NifResult, ResourceArc, Term};
+use rustler::{Binary, Encoder, Env, Error, NifResult, OwnedBinary, ResourceArc, Term};
 
 use once_cell::sync::Lazy;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -37,7 +39,12 @@ rustler::init!(
         isolate_alive,
         isolate_cancel,
         isolate_test_panic,
-        isolate_test_stall
+        isolate_test_stall,
+        snapshot_create,
+        snapshot_info,
+        snapshot_to_binary,
+        snapshot_from_binary,
+        isolate_new_from_snapshot
     ],
     load = init
 );
@@ -45,6 +52,10 @@ rustler::init!(
 /// The NIF resource behind `JSEngine.create_isolate/1`. Garbage collection
 /// of the last reference shuts the isolate thread down.
 pub struct IsolateResource(Isolate);
+
+/// The NIF resource behind `JSEngine.create_snapshot/3` (D54): a V8 startup
+/// snapshot of a loaded bundle, shared by every isolate started from it.
+pub struct SnapshotResource(Arc<StartupSnapshot>);
 
 /// One per request. `JSEngine` cancels it when it stops waiting, and a
 /// cancelled request sends no reply, so a late answer never lands in the
@@ -80,6 +91,7 @@ static GLOBAL_CHANNEL: Lazy<ChannelSender> = Lazy::new(|| {
 fn init(env: Env, _term: rustler::Term) -> bool {
     rustler::resource!(IsolateResource, env);
     rustler::resource!(ReplyTicket, env);
+    rustler::resource!(SnapshotResource, env);
     true
 }
 
@@ -328,6 +340,90 @@ fn isolate_test_stall<'a>(
             })
         } else {
             (atoms::error(), atoms::unsupported()).encode(env)
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Startup snapshots (D54). A snapshot is made once per bundle and per NIF
+// build; isolates started from it skip loading the bundle.
+// ---------------------------------------------------------------------------
+
+/// Runs `code` once and snapshots the heap. Blocks a dirty scheduler for
+/// about as long as a load of `code` plus the serialisation.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn snapshot_create(env: Env, name: String, code: String, timeout_ms: u64) -> Term {
+    guard(env, || {
+        let timeout = Duration::from_millis(timeout_ms).min(isolate::MAX_TIMEOUT);
+        match snapshot::create(&name, code, timeout) {
+            Ok(snapshot) => (
+                atoms::ok(),
+                ResourceArc::new(SnapshotResource(Arc::new(snapshot))),
+            )
+                .encode(env),
+            Err(failure) => error_term(env, &failure),
+        }
+    })
+}
+
+/// `%{bundle_sha256: hex, size: bytes, build_id: string}`.
+#[rustler::nif]
+fn snapshot_info(env: Env, resource: ResourceArc<SnapshotResource>) -> Term {
+    guard(env, || {
+        let hex: String = resource
+            .0
+            .bundle_sha256()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let map = Term::map_new(env);
+        map.map_put(atoms::bundle_sha256().encode(env), hex.encode(env))
+            .and_then(|m| m.map_put(atoms::size().encode(env), resource.0.size().encode(env)))
+            .and_then(|m| m.map_put(atoms::build_id().encode(env), snapshot::build_id().encode(env)))
+            .unwrap_or_else(|_| error_term(env, &Failure::Panic("cannot build the info map".into())))
+    })
+}
+
+/// The snapshot as a binary for a cache, stamped with this build's id.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn snapshot_to_binary(env: Env, resource: ResourceArc<SnapshotResource>) -> Term {
+    guard(env, || {
+        let bytes = resource.0.to_bytes();
+        match OwnedBinary::new(bytes.len()) {
+            Some(mut binary) => {
+                binary.as_mut_slice().copy_from_slice(&bytes);
+                (atoms::ok(), binary.release(env)).encode(env)
+            }
+            None => error_term(env, &Failure::Oom),
+        }
+    })
+}
+
+/// `{:ok, snapshot}`, or `{:error, :stale}` for another build's bytes and
+/// `{:error, :corrupt}` for damaged ones. V8 never sees refused bytes.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn snapshot_from_binary<'a>(env: Env<'a>, bytes: Binary<'a>) -> Term<'a> {
+    guard(env, || match StartupSnapshot::from_bytes(bytes.as_slice()) {
+        Ok(snapshot) => (
+            atoms::ok(),
+            ResourceArc::new(SnapshotResource(Arc::new(snapshot))),
+        )
+            .encode(env),
+        Err(Refused::Stale) => (atoms::error(), atoms::stale()).encode(env),
+        Err(Refused::Corrupt) => (atoms::error(), atoms::corrupt()).encode(env),
+    })
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn isolate_new_from_snapshot(
+    env: Env,
+    heap_mb: u64,
+    resource: ResourceArc<SnapshotResource>,
+) -> Term {
+    guard(env, || {
+        match Isolate::spawn_from(heap_mb as usize, Some(resource.0.clone())) {
+            Ok(isolate) => (atoms::ok(), ResourceArc::new(IsolateResource(isolate))).encode(env),
+            Err(failure) => error_term(env, &failure),
         }
     })
 }

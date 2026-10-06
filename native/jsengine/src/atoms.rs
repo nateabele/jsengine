@@ -38,4 +38,11 @@ rustler::atoms! {
     dead,
     unsupported,
     jsengine_reply,
+
+    // Startup snapshots (D54)
+    stale,
+    corrupt,
+    bundle_sha256,
+    size,
+    build_id,
 }

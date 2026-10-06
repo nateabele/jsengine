@@ -3,6 +3,7 @@ name = "jsengine"
 version = "0.1.0"
 authors = []
 edition = "2021"
+build = "build.rs"
 
 [lib]
 name = "jsengine"
@@ -24,3 +25,9 @@ deno_ast = { version = "0.32", features = ["transpiling"] }
 tokio = { version = "1.34.0", features = ["full"] }
 quick-error = "2.0.1"
 once_cell = "1.18.0"
+# D54: the bundle hash that keys a startup snapshot, and the payload checksum of a stored one.
+sha2 = "0.10"
+
+[dev-dependencies]
+# Process CPU time in the snapshot measurements.
+libc = "0.2"
