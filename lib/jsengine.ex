@@ -167,7 +167,7 @@ defmodule JSEngine do
 
   Returns `{:ok, snapshot}` or `{:error, reason}` (the reasons of `create_snapshot/3`). A snapshot
   and a deterministic failure (`{:error, {:js, msg}}`, `{:error, :oom}`) are remembered for that
-  hash: until `code` changes (or `forget_snapshot/1`), later calls return them without trying
+  hash (an `:oom` only for the same `:heap_mb`: a call with another limit tries again): until `code` changes (or `forget_snapshot/1`), later calls return them without trying
   again. Any other failure (`:timeout`, `{:panic, msg}`, `:dead`, `:badarg`) may be transient
   (a loaded machine, a host fault, bad options) and is not remembered: the next call tries again.
   A call with changed code makes a new snapshot and replaces the entry.
@@ -182,20 +182,21 @@ defmodule JSEngine do
   def snapshot_for(name, code, opts \\ %{}) when is_binary(name) and is_binary(code) and is_map(opts) do
     key = {__MODULE__, :snapshot, name}
     sha = :crypto.hash(:sha256, code)
+    heap_mb = Map.get(opts, :heap_mb, @default_heap_mb)
 
-    case cached(key, sha) do
+    case cached(key, sha, heap_mb) do
       {:ok, result} ->
         result
 
       :miss ->
         :global.trans({key, self()}, fn ->
-          case cached(key, sha) do
+          case cached(key, sha, heap_mb) do
             {:ok, result} ->
               result
 
             :miss ->
               result = create_snapshot(name, code, opts)
-              if remembered?(result), do: :persistent_term.put(key, {sha, result})
+              if remembered?(result), do: :persistent_term.put(key, {sha, heap_mb, result})
               result
           end
         end, [node()])
@@ -207,9 +208,13 @@ defmodule JSEngine do
   defp remembered?({:error, :oom}), do: true
   defp remembered?(_), do: false
 
-  defp cached(key, sha) do
+  # An :oom depends on the heap limit it was made under: it answers only a call with the same
+  # `:heap_mb`. A snapshot and a JS error do not depend on it.
+  defp cached(key, sha, heap_mb) do
     case :persistent_term.get(key, nil) do
-      {^sha, result} -> {:ok, result}
+      {^sha, ^heap_mb, result} -> {:ok, result}
+      {^sha, _other_heap, {:error, :oom}} -> :miss
+      {^sha, _other_heap, result} -> {:ok, result}
       _ -> :miss
     end
   end

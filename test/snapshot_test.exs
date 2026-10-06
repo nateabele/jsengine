@@ -134,6 +134,22 @@ defmodule JSEngine.SnapshotTest do
     assert retry_us >= 300_000
   end
 
+  test "snapshot_for/3 remembers an :oom only for the heap_mb it was made under" do
+    name = "heap-#{System.unique_integer([:positive])}.js"
+    on_exit(fn -> JSEngine.forget_snapshot(name) end)
+    # About 100 MB live at load: over a 32 MB cap, under 512 MB.
+    big = "globalThis.blocks = []; for (let i = 0; i < 125; i++) blocks.push(new Array(100000).fill(1.5)); globalThis.n = () => blocks.length;"
+
+    assert {:error, :oom} = JSEngine.snapshot_for(name, big, %{heap_mb: 32})
+    {again_us, {:error, :oom}} = :timer.tc(fn -> JSEngine.snapshot_for(name, big, %{heap_mb: 32}) end)
+    assert again_us < 20_000, "the :oom at 32 MB was retried (#{again_us} us)"
+
+    # A bigger heap tries again, and the snapshot replaces the :oom.
+    assert {:ok, snapshot} = JSEngine.snapshot_for(name, big, %{heap_mb: 512})
+    assert {:ok, ^snapshot} = JSEngine.snapshot_for(name, big, %{heap_mb: 512})
+    assert {:ok, "125"} = JSEngine.call(isolate!(%{heap_mb: 512, snapshot: snapshot}), "n", "[]", 5_000)
+  end
+
   test "snapshot_for/3 does not remember a timeout: the next call tries again" do
     name = "slow-#{System.unique_integer([:positive])}.js"
     on_exit(fn -> JSEngine.forget_snapshot(name) end)
