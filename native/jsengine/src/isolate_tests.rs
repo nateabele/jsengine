@@ -246,3 +246,97 @@ fn every_isolate_gets_the_young_generation_and_keeps_its_old_generation_budget()
         "heap_size_limit of the snapshotting isolate"
     );
 }
+
+/// Timer probes shared with the snapshot tests: each returns a promise that
+/// settles once its timers are done.
+pub(crate) const TIMER_PROBES: &str = r#"
+globalThis.timerId = () => { const a = setTimeout(() => {}, 0), b = setTimeout(() => {}, 0); return [typeof a, b - a]; };
+globalThis.cleared = () => new Promise((r) => {
+  let fired = false;
+  const id = setTimeout(() => { fired = true; }, 5);
+  clearTimeout(id);
+  setTimeout(() => r(fired), 40);
+});
+globalThis.inOrder = () => new Promise((r) => {
+  const seen = [];
+  setTimeout(() => seen.push("c"), 30);
+  setTimeout(() => seen.push("a"), 1);
+  const dropped = setTimeout(() => seen.push("x"), 15);
+  setTimeout(() => seen.push("b"), 15);
+  clearTimeout(dropped);
+  setTimeout((p, q) => seen.push(p + q), 45, "d", "!");
+  setTimeout(() => r(seen), 60);
+});
+globalThis.noops = () => new Promise((r) => {
+  const seen = [];
+  clearTimeout(undefined); clearTimeout(); clearTimeout(null); clearTimeout(987654321); clearTimeout("nope");
+  const fired = setTimeout(() => seen.push("first"), 1);
+  const other = setTimeout(() => seen.push("other"), 30);
+  setTimeout(() => { clearTimeout(fired); clearTimeout(fired); seen.push("cleared a fired id"); }, 10);
+  setTimeout(() => r(seen), 50);
+});
+"#;
+
+pub(crate) fn assert_timer_probes(isolate: &Isolate) {
+    assert_eq!(call(isolate, "timerId", "[]", TIMEOUT), Reply::Value(r#"["number",1]"#.into()));
+    assert_eq!(call(isolate, "cleared", "[]", TIMEOUT), Reply::Value("false".into()));
+    assert_eq!(call(isolate, "inOrder", "[]", TIMEOUT), Reply::Value(r#"["a","b","c","d!"]"#.into()));
+    assert_eq!(
+        call(isolate, "noops", "[]", TIMEOUT),
+        Reply::Value(r#"["first","cleared a fired id","other"]"#.into())
+    );
+}
+
+#[test]
+fn clear_timeout_cancels_and_uncleared_timers_fire_in_order() {
+    let isolate = Isolate::spawn(64).expect("spawn");
+    assert_eq!(load(&isolate, TIMER_PROBES), Reply::Loaded);
+    assert_timer_probes(&isolate);
+}
+
+/// Used heap after a full GC (what the `LowMemory` test hook does).
+fn used_after_gc(runtime: &mut JsRuntime) -> usize {
+    runtime.v8_isolate().low_memory_notification();
+    let mut stats = v8::HeapStatistics::default();
+    runtime.v8_isolate().get_heap_statistics(&mut stats);
+    stats.used_heap_size()
+}
+
+/// Arms 200 one-minute timers, each closing over 200 KB, then clears them:
+/// after a GC the heap must be back where it started. The interop `invoke`
+/// leak (aravis cold start, 100k entries) was exactly these closures.
+pub(crate) fn assert_cleared_closures_are_released(snapshot: Option<&crate::snapshot::StartupSnapshot>) {
+    const MB: usize = 1024 * 1024;
+    let (mut runtime, _shared, tokio_rt) = start(256, snapshot).expect("start");
+    {
+        let _enter = tokio_rt.enter();
+        let base = used_after_gc(&mut runtime);
+        runtime
+            .execute_script_static(
+                "arm.js",
+                "globalThis.ids = []; for (let i = 0; i < 200; i++) { const big = new Array(25000).fill(i + 0.5); ids.push(setTimeout(() => big.length, 60000)); }",
+            )
+            .expect("arm");
+        let armed = used_after_gc(&mut runtime);
+        runtime
+            .execute_script_static("clear.js", "for (const id of globalThis.ids) clearTimeout(id); globalThis.ids = null;")
+            .expect("clear");
+        let cleared = used_after_gc(&mut runtime);
+        println!("[clear-timeout] used heap KB: base {}, armed {}, cleared {}", base / 1024, armed / 1024, cleared / 1024);
+        assert!(armed > base + 30 * MB, "the closures were not retained while armed: {base} -> {armed}");
+        assert!(cleared < base + 2 * MB, "cleared timers still hold their closures: base {base}, cleared {cleared}");
+        // The Rust-side sleeps are cancelled, not left to run out their minute:
+        // the event loop has nothing left to wait for.
+        let drained = tokio_rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), runtime.run_event_loop(Default::default())).await
+        });
+        assert!(matches!(drained, Ok(Ok(()))), "cleared timers left async work pending");
+    }
+    let _enter = tokio_rt.enter();
+    drop(runtime);
+}
+
+#[test]
+fn clear_timeout_releases_the_closure_at_once() {
+    assert_cleared_closures_are_released(None);
+}

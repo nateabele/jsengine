@@ -4,11 +4,12 @@ use deno_ast::{EmitOptions, MediaType, ParseParams};
 use deno_core::error::AnyError;
 use deno_core::serde_json::Value;
 use deno_core::{
-    anyhow, op2, serde_v8, v8, Extension, FastString, FsModuleLoader, JsRuntime, ModuleCode,
-    ModuleSpecifier, Op, RuntimeOptions, Snapshot,
+    anyhow, op2, serde_v8, v8, CancelFuture, CancelHandle, Extension, FastString, FsModuleLoader,
+    JsRuntime, ModuleCode, ModuleSpecifier, Op, OpState, ResourceId, RuntimeOptions, Snapshot,
 };
 use crate::isolate::panic_message;
 use deno_core::futures::FutureExt;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
@@ -55,19 +56,20 @@ fn transpile_typescript(code: &str, specifier: &str) -> Result<String, String> {
     Ok(transpiled.text)
 }
 
-/// The jsengine host extension (the ops behind `setTimeout`). A startup
+/// The jsengine host extension (the ops behind `setTimeout` and
+/// `clearTimeout`). A startup
 /// snapshot and every runtime started from it must register exactly this
 /// list, in this order: V8 resolves the op functions a snapshot refers to by
 /// their index among the external references (D54).
 pub(crate) fn host_extensions() -> Vec<Extension> {
     vec![Extension {
         name: "core:apis",
-        ops: std::borrow::Cow::Borrowed(&[op_set_timeout::DECL]),
+        ops: std::borrow::Cow::Borrowed(&[op_set_timeout::DECL, op_timer_handle::DECL]),
         ..Default::default()
     }]
 }
 
-/// Installs the host APIs (console, setTimeout) in a fresh context. A runtime
+/// Installs the host APIs (console, setTimeout, clearTimeout) in a fresh context. A runtime
 /// started from a snapshot already has them.
 pub(crate) fn bootstrap(runtime: &mut JsRuntime) -> Result<(), anyhow::Error> {
     runtime.execute_script_static("[core:runtime]", include_str!("./runtime.js"))?;
@@ -117,7 +119,8 @@ pub(crate) fn init_v8() {
     });
 }
 
-/// Builds a JsRuntime with the jsengine host APIs (console, setTimeout).
+/// Builds a JsRuntime with the jsengine host APIs (console, setTimeout,
+/// clearTimeout).
 /// `create_params` carries the heap limits of a hardened isolate; the legacy
 /// engine passes `None`. With `snapshot`, the runtime starts from that V8
 /// startup snapshot (D54) instead of a pristine context.
@@ -366,13 +369,34 @@ async fn eval_raw(
 // promise instead. Bad delays (negative, NaN, non-numbers) never get here:
 // the #[serde] u64 conversion throws a TypeError in JavaScript, and tokio
 // clamps huge delays to its far future.
+//
+// `rid` is the timer's CancelHandle (op_timer_handle). clearTimeout closes
+// it, which cancels the sleep: the op then rejects (runtime.js ignores the
+// rejection of a cleared timer) and deno_core drops its promise on the next
+// poll, instead of holding it until the delay runs out.
 #[op2(async)]
-async fn op_set_timeout(#[serde] delay: u64) -> Result<(), AnyError> {
+async fn op_set_timeout(
+    state: Rc<RefCell<OpState>>,
+    #[serde] delay: u64,
+    #[smi] rid: ResourceId,
+) -> Result<(), AnyError> {
+    let cancel = state.borrow().resource_table.get::<CancelHandle>(rid)?;
     // The async block defers creating the timer into the guarded poll.
     AssertUnwindSafe(async move {
         tokio::time::sleep(std::time::Duration::from_millis(delay)).await
     })
     .catch_unwind()
+    .or_cancel(cancel)
     .await
+    .map_err(|canceled| anyhow::anyhow!(canceled))?
     .map_err(|payload| anyhow::anyhow!("setTimeout failed: {}", panic_message(&*payload)))
+}
+
+/// A new timer's cancel handle: a resource that clearTimeout (or the timer
+/// firing) closes. Fresh per runtime; a snapshot holds none, because a
+/// bundle with a pending timer at load is refused.
+#[op2(fast)]
+#[smi]
+fn op_timer_handle(state: &mut OpState) -> ResourceId {
+    state.resource_table.add(CancelHandle::new())
 }

@@ -150,6 +150,8 @@ pub fn bundle_sha256(code: &str) -> [u8; 32] {
 /// Refused (`Js`): a script that throws, and a script that leaves async work
 /// pending (a timer or an op started at load): a snapshot cannot carry it,
 /// so an isolate started from it would differ from one that loaded the code.
+/// A timer armed and cleared at load counts too: its cancelled sleep is a
+/// task that ends only when tokio next runs it, after this check.
 /// A script that runs past `timeout` is stopped (`Timeout`); one whose heap
 /// grows past `heap_mb` MiB is stopped (`Oom`). See the module doc for the
 /// bundles V8 cannot snapshot at all.

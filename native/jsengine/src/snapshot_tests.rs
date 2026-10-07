@@ -522,3 +522,18 @@ fn a_bundle_that_churns_young_garbage_at_load_snapshots_at_the_smallest_heap() {
     let isolate = Isolate::spawn_from(64, Some(Arc::new(snapshot))).expect("spawn");
     assert_eq!(call(&isolate, "kept", "[]", TIMEOUT), Reply::Value("20000000".into()));
 }
+
+#[test]
+fn timers_work_in_an_isolate_from_a_snapshot() {
+    let code = format!("{}\nglobalThis.nextId = () => setTimeout(() => {{}}, 0);", crate::isolate::tests::TIMER_PROBES);
+    let snapshot = snapshot_of(&code);
+    let started = Isolate::spawn_from(64, Some(snapshot.clone())).expect("spawn from snapshot");
+    crate::isolate::tests::assert_timer_probes(&started);
+    // A fresh isolate from the snapshot numbers its timers like one that
+    // loaded the bundle.
+    let loaded = Isolate::spawn(64).expect("spawn");
+    assert_eq!(load(&loaded, &code), Reply::Loaded);
+    let fresh = Isolate::spawn_from(64, Some(snapshot.clone())).expect("spawn from snapshot");
+    assert_eq!(call(&fresh, "nextId", "[]", TIMEOUT), call(&loaded, "nextId", "[]", TIMEOUT));
+    crate::isolate::tests::assert_cleared_closures_are_released(Some(&snapshot));
+}
