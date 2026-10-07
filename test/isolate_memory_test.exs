@@ -5,14 +5,57 @@ defmodule JSEngine.IsolateMemoryTest do
 
   @bundle Path.expand("../bench/fixtures/elm-try.min.js", __DIR__)
 
-  # macOS physical footprint, the memory the OS charges the process. RSS is
-  # the wrong measure here: libmalloc marks freed pages reusable (MADV_FREE)
-  # and they stay in RSS until the kernel needs them, so RSS stays hundreds
-  # of MB high after a mass destroy although nothing is live.
-  defp footprint_kb do
+  # The memory the process holds, in KB: the macOS physical footprint (the
+  # memory the OS charges the process) less malloc's fragmentation (the dirty
+  # malloc pages that hold no live allocation). RSS is the wrong measure:
+  # libmalloc marks freed pages reusable (MADV_FREE) and they stay in RSS, so
+  # RSS stays hundreds of MB high after a mass destroy although nothing is
+  # live. The footprint alone is wrong too: libmalloc keeps freed regions
+  # dirty, whole (`MALLOC_SMALL (empty)`, which grows about 4 MB a round up to
+  # a cap near 50 MB) and partly used (one-off steps of up to 20 MB), so it
+  # rose by 11 to 35 MB over the two rounds below with no leak, more under
+  # load. Without the fragmentation the same runs moved by -1 to +3 MB. Live
+  # malloc allocations, V8 heaps (VM_ALLOCATE) and thread stacks all stay in
+  # the measure.
+  defp live_kb do
     {out, 0} = System.cmd("vmmap", ["--summary", System.pid()], stderr_to_stdout: true)
-    [_, n, unit] = Regex.run(~r/Physical footprint:\s+([0-9.]+)([KMG])/, out)
-    round(elem(Float.parse(n), 0) * %{"K" => 1, "M" => 1024, "G" => 1_048_576}[unit])
+    [_, footprint] = Regex.run(~r/Physical footprint:\s+(\S+)/, out) || flunk("vmmap: no Physical footprint line:\n#{out}")
+
+    # The MALLOC ZONE table: the column header is the line above "MALLOC
+    # ZONE", the rows follow its "=====" line up to a blank line or the
+    # "=====" above TOTAL. A zone name may hold spaces, so a row's values are
+    # counted from its end: one per header column, plus "% FRAG" before
+    # REGION COUNT.
+    [_, header, rows] =
+      Regex.run(~r/^(.*)\nMALLOC ZONE.*\n=+.*\n((?:(?!=)\S.*\n)+)/m, out) ||
+        flunk("vmmap: no MALLOC ZONE table:\n#{out}")
+
+    columns = String.split(header)
+
+    assert columns == ~w(VIRTUAL RESIDENT DIRTY SWAPPED ALLOCATION BYTES DIRTY+SWAP REGION),
+           "vmmap: unexpected MALLOC ZONE columns #{inspect(columns)}"
+
+    frag_at = Enum.find_index(columns, &(&1 == "DIRTY+SWAP"))
+
+    frag =
+      rows
+      |> String.split("\n", trim: true)
+      |> Enum.map(fn row -> row |> String.split() |> Enum.take(-(length(columns) + 1)) |> Enum.at(frag_at) |> kb() end)
+      |> Enum.sum()
+
+    %{footprint: kb(footprint), frag: frag, live: kb(footprint) - frag}
+  end
+
+  # A vmmap size ("824", "176K", "71.0M") in KB; vmmap prints a bare number in bytes.
+  defp kb(size) do
+    case Regex.run(~r/^([0-9.]+)([BKMGT]?)$/, size || "") do
+      [_, n, unit] ->
+        scale = %{"" => 1 / 1024, "B" => 1 / 1024, "K" => 1, "M" => 1024, "G" => 1_048_576, "T" => 1_073_741_824}[unit]
+        round(elem(Float.parse(n), 0) * scale)
+
+      nil ->
+        raise ArgumentError, "vmmap: unknown size #{inspect(size)}"
+    end
   end
 
   defp create_loaded(count, code) do
@@ -37,16 +80,23 @@ defmodule JSEngine.IsolateMemoryTest do
     # Warm-up round: allocator and V8 process-wide state reach their plateau.
     code |> then(&create_loaded(200, &1)) |> Enum.each(&JSEngine.destroy/1)
     Process.sleep(500)
-    plateau = footprint_kb()
+    plateau = live_kb()
 
     for _ <- 1..2, do: code |> then(&create_loaded(200, &1)) |> Enum.each(&JSEngine.destroy/1)
     Process.sleep(500)
-    after_kb = footprint_kb()
+    after_kb = live_kb()
 
-    # 400 more isolates. deno_core 0.230 itself leaks about 4.5 KB per
-    # runtime (about 2 MB here); anything per isolate in jsengine (a kept
-    # thread, runtime or heap) would be hundreds of KB each.
-    assert after_kb - plateau <= 12 * 1024,
-           "footprint KB: plateau #{plateau}, after 400 more isolates #{after_kb}"
+    # 400 more isolates, 12 MB: 30 KB per isolate. Anything per isolate in
+    # jsengine (a kept thread, runtime or heap) is hundreds of KB each and
+    # fails: controls that kept 1 KB malloc blocks per isolate measured +43 MB
+    # for 100 KB, +19 MB for 40 KB and +12.5 MB for 25 KB, all failing. Live
+    # malloc grows about 8 KB per isolate on master (3.4 MB here; deno_core
+    # 0.230 itself leaks about 4.5 KB per runtime), and VM_ALLOCATE (mostly
+    # V8's mappings) shrinks by 1 to 3 MB over these rounds, which hides as
+    # much growth. So
+    # the detection floor is about 25 KB per isolate on top of the known
+    # leaks; a smaller leak can pass.
+    assert after_kb.live - plateau.live <= 12 * 1024,
+           "KB, footprint less malloc fragmentation: plateau #{inspect(plateau)}, after 400 more isolates #{inspect(after_kb)}"
   end
 end
