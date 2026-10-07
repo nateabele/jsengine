@@ -16,10 +16,16 @@ defmodule JSEngine.IsolateMemoryTest do
   # rose by 11 to 35 MB over the two rounds below with no leak, more under
   # load. Without the fragmentation the same runs moved by -1 to +3 MB. Live
   # malloc allocations, V8 heaps (VM_ALLOCATE) and thread stacks all stay in
-  # the measure.
+  # the measure. It is less sensitive to page pinning: a small live block
+  # kept per isolate also keeps its dirty page, but only the block counts
+  # (the rest of the page is fragmentation).
   defp live_kb do
     {out, 0} = System.cmd("vmmap", ["--summary", System.pid()], stderr_to_stdout: true)
     [_, footprint] = Regex.run(~r/Physical footprint:\s+(\S+)/, out) || flunk("vmmap: no Physical footprint line:\n#{out}")
+
+    # vmmap prints one decimal: in G that is about 100 MB, too coarse for the
+    # 12 MB budget.
+    assert String.ends_with?(footprint, ["K", "M"]), "vmmap: footprint #{footprint} is not in K or M"
 
     # The MALLOC ZONE table: the column header is the line above "MALLOC
     # ZONE", the rows follow its "=====" line up to a blank line or the
@@ -42,6 +48,9 @@ defmodule JSEngine.IsolateMemoryTest do
       |> String.split("\n", trim: true)
       |> Enum.map(fn row -> row |> String.split() |> Enum.take(-(length(columns) + 1)) |> Enum.at(frag_at) |> kb() end)
       |> Enum.sum()
+
+    # A parse that stopped early would under-subtract and read as growth.
+    assert frag > 0 and frag < kb(footprint), "vmmap: fragmentation #{frag} KB of footprint #{footprint}:\n#{out}"
 
     %{footprint: kb(footprint), frag: frag, live: kb(footprint) - frag}
   end
@@ -89,13 +98,13 @@ defmodule JSEngine.IsolateMemoryTest do
     # 400 more isolates, 12 MB: 30 KB per isolate. Anything per isolate in
     # jsengine (a kept thread, runtime or heap) is hundreds of KB each and
     # fails: controls that kept 1 KB malloc blocks per isolate measured +43 MB
-    # for 100 KB, +19 MB for 40 KB and +12.5 MB for 25 KB, all failing. Live
+    # for 100 KB and +19 MB for 40 KB. A clean run moves -1 to +3 MB: live
     # malloc grows about 8 KB per isolate on master (3.4 MB here; deno_core
-    # 0.230 itself leaks about 4.5 KB per runtime), and VM_ALLOCATE (mostly
-    # V8's mappings) shrinks by 1 to 3 MB over these rounds, which hides as
-    # much growth. So
-    # the detection floor is about 25 KB per isolate on top of the known
-    # leaks; a smaller leak can pass.
+    # 0.230 leaks about 4.5 KB per runtime, the rest is unattributed), and
+    # VM_ALLOCATE (mostly V8's mappings) shrinks by 1 to 3 MB, which hides as
+    # much growth. Detection floor, on top of that 8 KB baseline: reliably
+    # about 40 KB per isolate; a 25 KB leak (+12.5 MB in one run) fails only
+    # when the baseline lands high, and a smaller one passes.
     assert after_kb.live - plateau.live <= 12 * 1024,
            "KB, footprint less malloc fragmentation: plateau #{inspect(plateau)}, after 400 more isolates #{inspect(after_kb)}"
   end
