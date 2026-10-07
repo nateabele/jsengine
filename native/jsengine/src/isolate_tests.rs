@@ -203,3 +203,37 @@ fn a_huge_timeout_is_clamped_instead_of_overflowing() {
     assert_eq!(call(&isolate, "one", "[]", Duration::MAX), Reply::Value("1".into()));
     assert!(isolate.is_alive());
 }
+
+/// The heap of an isolate made by `start`: (heap_size_limit, the old-generation budget left after
+/// the young generation is taken out of it). V8's limit is 2 semi-spaces + a new large-object space
+/// of one semi-space + the old generation.
+fn heap_limits_of(heap_mb: usize, snapshot: Option<&crate::snapshot::StartupSnapshot>) -> (usize, usize) {
+    let (mut runtime, _shared, tokio_rt) = start(heap_mb, snapshot).expect("start");
+    let mut stats = v8::HeapStatistics::default();
+    runtime.v8_isolate().get_heap_statistics(&mut stats);
+    let limit = stats.heap_size_limit();
+    {
+        let _enter = tokio_rt.enter();
+        drop(runtime);
+    }
+    (limit, limit.saturating_sub(3 * crate::engine::SEMI_SPACE_MB * 1024 * 1024))
+}
+
+#[test]
+fn every_isolate_gets_the_young_generation_and_keeps_its_old_generation_budget() {
+    const MB: usize = 1024 * 1024;
+    let snapshot = crate::snapshot::create("young.js", "globalThis.one = () => 1;".into(), TIMEOUT, 256)
+        .expect("snapshot");
+    for heap_mb in [16, 64, 256] {
+        let (limit, old) = heap_limits_of(heap_mb, None);
+        // Before the flag, V8 split `heap_mb` into a 1 MiB semi-space (3 MiB young generation)
+        // and the rest: the old generation keeps that budget, page-rounded (256 KiB).
+        let before = heap_mb * MB - 3 * MB;
+        assert!(
+            old <= before && before - old < 256 * 1024,
+            "heap_mb {heap_mb}: limit {limit}, old-generation budget {old}, expected about {before}"
+        );
+        // An isolate started from a snapshot gets the same heap.
+        assert_eq!(heap_limits_of(heap_mb, Some(&snapshot)), (limit, old), "heap_mb {heap_mb}");
+    }
+}

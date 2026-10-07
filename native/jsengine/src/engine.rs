@@ -12,6 +12,7 @@ use deno_core::futures::FutureExt;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
+use std::sync::Once;
 
 pub(crate) type JsResult = Result<Value, Value>;
 pub(crate) type EnvId = u64;
@@ -73,6 +74,44 @@ pub(crate) fn bootstrap(runtime: &mut JsRuntime) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// The semi-space size, in MiB, of every isolate of this process: V8's
+/// young generation is two semi-spaces plus a new large-object space of the
+/// same size, so 3 x this.
+///
+/// Without it V8 derives the young generation from the `heap_limits` cap:
+/// at the 256 MiB default that is a 1 MiB semi-space, and the minor GCs
+/// dominate a long replay (aravis cold start: see unitB-report.md). rusty_v8
+/// 0.81 has no per-isolate setter for the young generation (the
+/// `ResourceConstraints` fields are private), so it is a process-wide V8
+/// flag. The flag wins over the size derived from `heap_limits`, and it
+/// leaves the old generation as `heap_limits` sized it: the `:oom` limit
+/// (the old-generation budget) does not shrink, and the heap's total
+/// reservation grows by 3 x (this - 1) MiB per isolate.
+///
+/// 16 MiB is the knee of the measured curve (Node's default too): the
+/// aravis cold-start replay is about 40% faster than at 1 MiB, 32 MiB is no
+/// faster, and a replayed isolate holds about 20 MiB more (32 MiB: 55 MiB).
+pub(crate) const SEMI_SPACE_MB: usize = 16;
+
+/// The semi-space an isolate starts with, in MiB. Starting at full size
+/// skips the scavenges that would grow it, and measured steadier than
+/// growing from 1 MiB, at the same memory once a replay has run.
+pub(crate) const INITIAL_SEMI_SPACE_MB: usize = 16;
+
+/// Sets jsengine's V8 flags, then initialises V8 (once per process). Every
+/// path that makes a runtime calls this first, so the flags are set before
+/// V8 starts (V8 freezes its flags at initialisation). A startup snapshot
+/// is made and read under the same flags, in the same process.
+pub(crate) fn init_v8() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        v8::V8::set_flags_from_string(&format!(
+            "--max-semi-space-size={SEMI_SPACE_MB} --min-semi-space-size={INITIAL_SEMI_SPACE_MB}"
+        ));
+        JsRuntime::init_platform(None);
+    });
+}
+
 /// Builds a JsRuntime with the jsengine host APIs (console, setTimeout).
 /// `create_params` carries the heap limits of a hardened isolate; the legacy
 /// engine passes `None`. With `snapshot`, the runtime starts from that V8
@@ -81,6 +120,7 @@ pub(crate) fn new_runtime(
     create_params: Option<v8::CreateParams>,
     snapshot: Option<Snapshot>,
 ) -> Result<JsRuntime, anyhow::Error> {
+    init_v8();
     let from_snapshot = snapshot.is_some();
     let mut runtime = JsRuntime::new(RuntimeOptions {
         module_loader: Some(Rc::new(FsModuleLoader)),

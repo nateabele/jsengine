@@ -189,8 +189,9 @@ fn snapshot_thread(
     // would do it with `--predictable --random-seed=42` for the whole BEAM
     // (single-threaded GC and compiler, the same Math.random sequence in
     // every isolate). Initialise it the normal way first; later calls are
-    // no-ops, so the snapshot is made under the flags that will read it.
-    JsRuntime::init_platform(None);
+    // no-ops, so the snapshot is made under the flags that will read it
+    // (jsengine's own flags included: the young-generation size).
+    crate::engine::init_v8();
 
     let bundle_sha256 = bundle_sha256(&code);
     let tokio_rt = tokio::runtime::Builder::new_current_thread()
