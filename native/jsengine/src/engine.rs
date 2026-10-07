@@ -5,11 +5,13 @@ use deno_core::error::AnyError;
 use deno_core::serde_json::Value;
 use deno_core::{
     anyhow, op2, serde_v8, v8, CancelFuture, CancelHandle, Extension, FastString, FsModuleLoader,
-    JsRuntime, ModuleCode, ModuleSpecifier, Op, OpState, ResourceId, RuntimeOptions, Snapshot,
+    JsRuntime, ModuleCode, ModuleSpecifier, Op, OpState, RcRef, Resource, ResourceId,
+    RuntimeOptions, Snapshot,
 };
 use crate::isolate::panic_message;
 use deno_core::futures::FutureExt;
-use std::cell::RefCell;
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
@@ -64,7 +66,7 @@ fn transpile_typescript(code: &str, specifier: &str) -> Result<String, String> {
 pub(crate) fn host_extensions() -> Vec<Extension> {
     vec![Extension {
         name: "core:apis",
-        ops: std::borrow::Cow::Borrowed(&[op_set_timeout::DECL, op_timer_handle::DECL]),
+        ops: std::borrow::Cow::Borrowed(&[op_set_timeout::DECL, op_timer_handle::DECL, op_clear_timer::DECL]),
         ..Default::default()
     }]
 }
@@ -370,33 +372,95 @@ async fn eval_raw(
 // the #[serde] u64 conversion throws a TypeError in JavaScript, and tokio
 // clamps huge delays to its far future.
 //
-// `rid` is the timer's CancelHandle (op_timer_handle). clearTimeout closes
-// it, which cancels the sleep: the op then rejects (runtime.js ignores the
-// rejection of a cleared timer) and deno_core drops its promise on the next
-// poll, instead of holding it until the delay runs out.
+// `rid` is the timer's handle (op_timer_handle). clearTimeout clears it
+// (op_clear_timer), which cancels the sleep: the op then rejects (runtime.js
+// ignores the rejection of a cleared timer) and deno_core drops its promise
+// on the next poll, instead of holding it until the delay runs out.
 #[op2(async)]
 async fn op_set_timeout(
     state: Rc<RefCell<OpState>>,
     #[serde] delay: u64,
     #[smi] rid: ResourceId,
 ) -> Result<(), AnyError> {
-    let cancel = state.borrow().resource_table.get::<CancelHandle>(rid)?;
+    let timer = state.borrow().resource_table.get::<TimerHandle>(rid)?;
+    let cancel = RcRef::map(timer.clone(), |t| &t.cancel);
     // The async block defers creating the timer into the guarded poll.
-    AssertUnwindSafe(async move {
+    let result = AssertUnwindSafe(async move {
         tokio::time::sleep(std::time::Duration::from_millis(delay)).await
     })
     .catch_unwind()
     .or_cancel(cancel)
-    .await
-    .map_err(|canceled| anyhow::anyhow!(canceled))?
-    .map_err(|payload| anyhow::anyhow!("setTimeout failed: {}", panic_message(&*payload)))
+    .await;
+    timer.ended.set(true);
+    if timer.counted.get() {
+        let mut state = state.borrow_mut();
+        let cleared = cleared_timers_mut(&mut state);
+        *cleared = cleared.saturating_sub(1);
+    }
+    result
+        .map_err(|canceled| anyhow::anyhow!(canceled))?
+        .map_err(|payload| anyhow::anyhow!("setTimeout failed: {}", panic_message(&*payload)))
 }
 
-/// A new timer's cancel handle: a resource that clearTimeout (or the timer
-/// firing) closes. Fresh per runtime; a snapshot holds none, because a
-/// bundle with a pending timer at load is refused.
+/// One timer: the handle that cancels its sleep, whether the sleep has
+/// ended, and whether clearTimeout counted it in `ClearedTimers`.
+struct TimerHandle {
+    cancel: CancelHandle,
+    ended: Cell<bool>,
+    counted: Cell<bool>,
+}
+
+impl Resource for TimerHandle {
+    fn name(&self) -> Cow<'_, str> {
+        "timer".into()
+    }
+
+    // The fire path closes the handle after the sleep ended: a no-op.
+    fn close(self: Rc<Self>) {
+        self.cancel.cancel();
+    }
+}
+
+/// The sleeps that clearTimeout cancelled and whose op has not ended yet:
+/// they are the only async work a snapshot may still drain (snapshot.rs).
+#[derive(Default)]
+struct ClearedTimers(usize);
+
+fn cleared_timers_mut(state: &mut OpState) -> &mut usize {
+    if state.try_borrow_mut::<ClearedTimers>().is_none() {
+        state.put(ClearedTimers::default());
+    }
+    &mut state.borrow_mut::<ClearedTimers>().0
+}
+
+/// How many cleared sleeps are still pending ops in `runtime`.
+pub(crate) fn cleared_timers(runtime: &mut JsRuntime) -> usize {
+    let state = runtime.op_state();
+    let state = state.borrow();
+    state.try_borrow::<ClearedTimers>().map_or(0, |c| c.0)
+}
+
+/// A new timer's handle: a resource that clearTimeout (or the timer firing)
+/// closes. Fresh per runtime; a snapshot holds none, because a bundle with a
+/// live timer at load is refused.
 #[op2(fast)]
 #[smi]
 fn op_timer_handle(state: &mut OpState) -> ResourceId {
-    state.resource_table.add(CancelHandle::new())
+    state.resource_table.add(TimerHandle {
+        cancel: CancelHandle::new(),
+        ended: Cell::new(false),
+        counted: Cell::new(false),
+    })
+}
+
+/// clearTimeout: removes the timer's handle and cancels its sleep. A sleep
+/// that has not ended is counted until its op ends. An unknown rid is a no-op.
+#[op2(fast)]
+fn op_clear_timer(state: &mut OpState, #[smi] rid: ResourceId) {
+    if let Ok(timer) = state.resource_table.take::<TimerHandle>(rid) {
+        if !timer.ended.get() && !timer.counted.replace(true) {
+            *cleared_timers_mut(state) += 1;
+        }
+        timer.cancel.cancel();
+    }
 }

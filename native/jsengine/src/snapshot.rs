@@ -150,8 +150,8 @@ pub fn bundle_sha256(code: &str) -> [u8; 32] {
 /// Refused (`Js`): a script that throws, and a script that leaves async work
 /// pending (a timer or an op started at load): a snapshot cannot carry it,
 /// so an isolate started from it would differ from one that loaded the code.
-/// A timer armed and cleared at load counts too: its cancelled sleep is a
-/// task that ends only when tokio next runs it, after this check.
+/// A timer armed and cleared at load does not count: its cancelled sleep is
+/// drained before the check (`no_pending_work`).
 /// A script that runs past `timeout` is stopped (`Timeout`); one whose heap
 /// grows past `heap_mb` MiB is stopped (`Oom`). See the module doc for the
 /// bundles V8 cannot snapshot at all.
@@ -260,7 +260,7 @@ fn snapshot_thread(
         .block_on(async { runtime.execute_script(name, FastString::from(code)) })
         .map(|_| ())
         .map_err(|e| e.to_string())
-        .and_then(|()| no_pending_work(&mut runtime));
+        .and_then(|()| no_pending_work(&mut runtime, &tokio_rt));
     let _ = done_tx.send(());
     let _ = timer.join();
 
@@ -353,18 +353,30 @@ extern "C" fn heap_guard_near_limit(data: *mut c_void, current: usize, _initial:
     current.saturating_mul(2)
 }
 
-/// Polls the event loop once: nothing may be left to run.
-fn no_pending_work(runtime: &mut JsRuntime) -> Result<(), String> {
+/// Nothing may be left to run. A sleep cancelled by clearTimeout is a tokio
+/// task that ends only when tokio runs it, so when every pending op is such
+/// a sleep, tokio gets a few turns to end them. Only then: a live timer (or
+/// any other op) is never run here, and the bundle is refused.
+fn no_pending_work(runtime: &mut JsRuntime, tokio_rt: &tokio::runtime::Runtime) -> Result<(), String> {
+    for _ in 0..16 {
+        match poll_once(runtime) {
+            Poll::Ready(result) => return result,
+            Poll::Pending => {}
+        }
+        let pending = runtime.main_realm().num_pending_ops();
+        if pending == 0 || pending != crate::engine::cleared_timers(runtime) {
+            break;
+        }
+        tokio_rt.block_on(tokio::task::yield_now());
+    }
+    Err("the script left async work pending at load (a timer or an op); it cannot be snapshotted".to_string())
+}
+
+/// Polls the event loop once.
+fn poll_once(runtime: &mut JsRuntime) -> Poll<Result<(), String>> {
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
-    match runtime.poll_event_loop(&mut cx, false) {
-        Poll::Ready(Ok(())) => Ok(()),
-        Poll::Ready(Err(e)) => Err(e.to_string()),
-        Poll::Pending => Err(
-            "the script left async work pending at load (a timer or an op); it cannot be snapshotted"
-                .to_string(),
-        ),
-    }
+    runtime.poll_event_loop(&mut cx, false).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

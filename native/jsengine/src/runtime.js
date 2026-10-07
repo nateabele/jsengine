@@ -62,7 +62,7 @@
     const timer = timers.get(key);
     if (timer === undefined) return;
     timers.delete(key);
-    core.tryClose(timer.rid);
+    core.ops.op_clear_timer(timer.rid);
   };
 
 })(globalThis);

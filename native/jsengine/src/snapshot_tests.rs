@@ -536,4 +536,32 @@ fn timers_work_in_an_isolate_from_a_snapshot() {
     let fresh = Isolate::spawn_from(64, Some(snapshot.clone())).expect("spawn from snapshot");
     assert_eq!(call(&fresh, "nextId", "[]", TIMEOUT), call(&loaded, "nextId", "[]", TIMEOUT));
     crate::isolate::tests::assert_cleared_closures_are_released(Some(&snapshot));
+    crate::isolate::tests::assert_a_thrown_handler_is_released(Some(&snapshot));
+}
+
+#[test]
+fn a_timer_cleared_at_load_snapshots_and_a_live_one_is_refused() {
+    // Armed and cleared at load: the cancelled sleep is drained, the bundle
+    // snapshots, and the restored isolate numbers timers like a loaded one.
+    let cleared = "globalThis.fired = false; clearTimeout(setTimeout(() => { globalThis.fired = true; }, 60000)); clearTimeout(setTimeout(() => {}, 0)); globalThis.nextId = () => setTimeout(() => {}, 0); globalThis.check = () => new Promise((r) => setTimeout(() => r(fired), 20));";
+    let snapshot = snapshot_of(cleared);
+    let started = Isolate::spawn_from(64, Some(snapshot)).expect("spawn from snapshot");
+    let loaded = Isolate::spawn(64).expect("spawn");
+    assert_eq!(load(&loaded, cleared), Reply::Loaded);
+    assert_eq!(call(&started, "nextId", "[]", TIMEOUT), Reply::Value("3".into()));
+    assert_eq!(call(&loaded, "nextId", "[]", TIMEOUT), Reply::Value("3".into()));
+    assert_eq!(call(&started, "check", "[]", TIMEOUT), Reply::Value("false".into()));
+    // A live timer at load is still refused, with or without cleared ones.
+    for live in [
+        "setTimeout(() => {}, 0);",
+        "setTimeout(() => {}, 60000);",
+        "clearTimeout(setTimeout(() => {}, 60000)); setTimeout(() => {}, 60000);",
+        "const live = setTimeout(() => {}, 0); clearTimeout(setTimeout(() => {}, 60000));",
+        "for (let i = 0; i < 100; i++) clearTimeout(setTimeout(() => {}, 1)); setTimeout(() => {}, 1);",
+    ] {
+        match create("live.js", live.into(), TIMEOUT, HEAP_MB) {
+            Err(Failure::Js(message)) => assert!(message.contains("pending"), "{live}: {message}"),
+            other => panic!("{live}: expected a refusal, got {:?}", other.map(|s| s.size())),
+        }
+    }
 }

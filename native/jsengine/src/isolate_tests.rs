@@ -275,6 +275,20 @@ globalThis.noops = () => new Promise((r) => {
   setTimeout(() => { clearTimeout(fired); clearTimeout(fired); seen.push("cleared a fired id"); }, 10);
   setTimeout(() => r(seen), 50);
 });
+globalThis.rearm = () => new Promise((r) => {
+  const seen = [];
+  const self = setTimeout(() => {
+    clearTimeout(self);
+    seen.push("self");
+    setTimeout(() => { seen.push("rearmed"); r(seen); }, 5);
+  }, 1);
+});
+globalThis.throwLater = () => { globalThis.thrownId = setTimeout(() => { throw new Error("boom"); }, 1); return typeof thrownId; };
+globalThis.wait = (ms) => new Promise((r) => setTimeout(() => r(ms), ms));
+globalThis.afterThrow = () => new Promise((r) => {
+  clearTimeout(globalThis.thrownId);
+  setTimeout(() => r("fired after the throw"), 5);
+});
 "#;
 
 pub(crate) fn assert_timer_probes(isolate: &Isolate) {
@@ -285,6 +299,16 @@ pub(crate) fn assert_timer_probes(isolate: &Isolate) {
         call(isolate, "noops", "[]", TIMEOUT),
         Reply::Value(r#"["first","cleared a fired id","other"]"#.into())
     );
+    assert_eq!(call(isolate, "rearm", "[]", TIMEOUT), Reply::Value(r#"["self","rearmed"]"#.into()));
+    // A throwing handler is an unhandled rejection: it fails the call in
+    // flight when it fires (as before clearTimeout), and the isolate lives.
+    assert_eq!(call(isolate, "throwLater", "[]", TIMEOUT), Reply::Value(r#""number""#.into()));
+    match call(isolate, "wait", "[30]", TIMEOUT) {
+        Reply::Failed(Failure::Js(message)) => assert!(message.contains("boom"), "{message}"),
+        other => panic!("expected the handler's error, got {other:?}"),
+    }
+    assert_eq!(call(isolate, "afterThrow", "[]", TIMEOUT), Reply::Value(r#""fired after the throw""#.into()));
+    assert_eq!(call(isolate, "wait", "[5]", TIMEOUT), Reply::Value("5".into()));
 }
 
 #[test]
@@ -339,4 +363,59 @@ pub(crate) fn assert_cleared_closures_are_released(snapshot: Option<&crate::snap
 #[test]
 fn clear_timeout_releases_the_closure_at_once() {
     assert_cleared_closures_are_released(None);
+}
+
+/// A handler that throws leaves no timer entry behind: its 40 MB closure is
+/// released, and a later timer still fires. deno_core keeps the thrown error
+/// (whose stack frames reference the handler) until the next event-loop
+/// turn, so the heap is measured after a later timer has run.
+pub(crate) fn assert_a_thrown_handler_is_released(snapshot: Option<&crate::snapshot::StartupSnapshot>) {
+    const MB: usize = 1024 * 1024;
+    let (mut runtime, _shared, tokio_rt) = start(256, snapshot).expect("start");
+    {
+        let _enter = tokio_rt.enter();
+        let base = used_after_gc(&mut runtime);
+        runtime
+            .execute_script_static(
+                "throw.js",
+                "{ const big = new Array(5000000).fill(0.5); globalThis.thrownId = setTimeout(() => { throw new Error('boom ' + big.length); }, 1); }",
+            )
+            .expect("arm");
+        let armed = used_after_gc(&mut runtime);
+        let thrown = tokio_rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), runtime.run_event_loop(Default::default())).await
+        });
+        match thrown {
+            Ok(Err(e)) => assert!(e.to_string().contains("boom 5000000"), "{e}"),
+            other => panic!("expected the handler's error, got {other:?}"),
+        }
+        let after_throw = used_after_gc(&mut runtime);
+        runtime
+            .execute_script_static(
+                "later.js",
+                "globalThis.later = false; setTimeout(() => { globalThis.later = true; }, 1);",
+            )
+            .expect("later");
+        let drained = tokio_rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), runtime.run_event_loop(Default::default())).await
+        });
+        assert!(matches!(drained, Ok(Ok(()))), "the later timer did not settle");
+        let after = used_after_gc(&mut runtime);
+        println!("[clear-timeout] thrown handler, used heap KB: base {}, armed {}, after the throw {}, after a later timer {}", base / 1024, armed / 1024, after_throw / 1024, after / 1024);
+        assert!(armed > base + 30 * MB, "the closure was not retained while armed: {base} -> {armed}");
+        assert!(after < base + 2 * MB, "a thrown handler's closure is still held: base {base}, after {after}");
+        // Clearing the thrown timer's id is a no-op: its entry is gone.
+        let later = runtime
+            .execute_script_static("check.js", "clearTimeout(globalThis.thrownId); globalThis.later")
+            .expect("check");
+        let scope = &mut runtime.handle_scope();
+        assert!(v8::Local::new(scope, later).is_true(), "the later timer did not fire");
+    }
+    let _enter = tokio_rt.enter();
+    drop(runtime);
+}
+
+#[test]
+fn a_throwing_handler_is_released_and_later_timers_fire() {
+    assert_a_thrown_handler_is_released(None);
 }
