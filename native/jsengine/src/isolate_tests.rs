@@ -236,4 +236,13 @@ fn every_isolate_gets_the_young_generation_and_keeps_its_old_generation_budget()
         // An isolate started from a snapshot gets the same heap.
         assert_eq!(heap_limits_of(heap_mb, Some(&snapshot)), (limit, old), "heap_mb {heap_mb}");
     }
+    // The isolate that made the snapshot has no `heap_limits` (deno_core ignores create_params
+    // for it), so V8 gives it its default 700 MiB x 2 (no pointer compression) old generation;
+    // its young generation is jsengine's (without the flag it would be V8's default 16 MiB
+    // semi-space, 48 MiB).
+    assert_eq!(
+        crate::snapshot::SNAPSHOT_HEAP_LIMIT.load(SeqCst),
+        1400 * MB + 3 * crate::engine::SEMI_SPACE_MB * MB,
+        "heap_size_limit of the snapshotting isolate"
+    );
 }

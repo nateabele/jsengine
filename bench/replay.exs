@@ -1,17 +1,27 @@
-# Cold-start replay through a jsengine isolate: the aravis bench capture (one `init`, then its
+# Cold-start replay through jsengine isolates: the aravis bench capture (one `init`, then its
 # `applyLoggedPage` calls), the same calls as aravis interop/bench/coldstart/run-pages.js, so the
 # hashes compare with the Node driver's. Run from the jsengine root:
-#   mix run bench/replay.exs <bundle> <capture-dir> <mode> [runs] [held]
+#   MIX_ENV=test mix run bench/replay.exs <bundle> <capture-dir> <mode> [runs] [held] [replies-sha1 workspace-sha1]
 # <bundle>: aravis interop/dist/server-interop.min.js. <capture-dir>: interop/bench/coldstart/captures/current.
 # mode: load (create_isolate + load_source) | snapshot (create_isolate from a D54 snapshot).
-# Each run replays in a fresh isolate. Then `held` isolates (default 4) each replay and stay alive,
-# for the physical footprint per replayed isolate.
+#
+# 1. Memory, first, in a BEAM that has not run an isolate yet: `held` isolates (default 4) are
+#    started and held. The physical footprint per isolate is taken when they are fresh and idle,
+#    after each has replayed, after 10 s idle, and after a V8 low-memory notification
+#    (`JSEngine.__test_low_memory__/1`: MIX_ENV=test builds only; elsewhere that step is skipped).
+# 2. Speed: `runs` replays (default 3), each in a fresh isolate.
+#
+# Every replay is hashed (replies and final workspace). The bench exits 1 when two replays differ,
+# or when they differ from the expected pair given as the last two arguments.
 [bundle, dir, mode | rest] = System.argv()
-{runs, held} =
+int = fn s -> String.to_integer(s) end
+
+{runs, held, expected} =
   case rest do
-    [r, h | _] -> {String.to_integer(r), String.to_integer(h)}
-    [r] -> {String.to_integer(r), 4}
-    [] -> {3, 4}
+    [r, h, a, b | _] -> {int.(r), int.(h), {a, b}}
+    [r, h] -> {int.(r), int.(h), nil}
+    [r] -> {int.(r), 4, nil}
+    [] -> {3, 4, nil}
   end
 
 code = File.read!(bundle)
@@ -22,15 +32,16 @@ defmodule R do
   def sh(cmd), do: :os.cmd(String.to_charlist(cmd)) |> to_string()
   def loadavg, do: sh("sysctl -n vm.loadavg") |> String.trim()
   def med(l), do: Enum.at(Enum.sort(l), div(length(l), 2))
+  def f1(x), do: :erlang.float_to_binary(x / 1, decimals: 1)
 
   def footprint_kb(pid) do
+    :erlang.garbage_collect()
+
     case Regex.run(~r/Physical footprint:\s+([0-9.]+)([KMG])/, sh("vmmap --summary #{pid} 2>/dev/null")) do
       [_, v, u] -> round(elem(Float.parse(v), 0) * %{"K" => 1, "M" => 1024, "G" => 1_048_576}[u])
       _ -> -1
     end
   end
-
-  def rss_kb(pid), do: sh("ps -o rss= -p #{pid}") |> String.trim() |> String.to_integer()
 
   # The capture holds a JSON array (a legacy one: a JSON string of it).
   def args_json(text) do
@@ -52,8 +63,9 @@ defmodule R do
       |> Enum.sort()
 
     replay? = fn {_, fun, _} -> fun in ["applyLoggedPage", "applyLogged"] end
-    first = Enum.find_index(all, replay?)
-    {:ok, init} = all |> Enum.take(first) |> Enum.filter(fn {_, f, _} -> f == "init" end) |> List.last() |> then(&{:ok, &1})
+    first = Enum.find_index(all, replay?) || raise "no applyLoggedPage call in #{dir}"
+    init = all |> Enum.take(first) |> Enum.filter(fn {_, f, _} -> f == "init" end) |> List.last()
+    init || raise "no init before the first page in #{dir}"
     pages = all |> Enum.drop(first) |> Enum.take_while(replay?)
     read = fn {_, fun, f} -> {fun, args_json(File.read!(Path.join(dir, f)))} end
     {read.(init), Enum.map(pages, read)}
@@ -63,9 +75,8 @@ defmodule R do
   def replay(i, {"init", init_args}, pages) do
     [id | _] = :json.decode(init_args)
     t0 = System.monotonic_time(:microsecond)
-    h = :crypto.hash_init(:sha)
     {:ok, r} = JSEngine.call(i, "init", init_args, 60_000)
-    h = :crypto.hash_update(h, r)
+    h = :crypto.hash_update(:crypto.hash_init(:sha), r)
 
     h =
       Enum.reduce(pages, h, fn {fun, args}, h ->
@@ -104,6 +115,26 @@ end
 la0 = R.loadavg()
 cpu = R.sh("sysctl -n machdep.cpu.brand_string") |> String.trim()
 
+# 1. Memory.
+f0 = R.footprint_kb(pid)
+isos = for _ <- 1..held, do: start.()
+per = fn f -> div(f - f0, held) end
+fresh = per.(R.footprint_kb(pid))
+held_results = Enum.map(isos, &R.replay(&1, init, pages))
+replayed = per.(R.footprint_kb(pid))
+Process.sleep(10_000)
+idle = per.(R.footprint_kb(pid))
+
+low =
+  # An older NIF has no such hook: its stub raises.
+  case Enum.map(isos, fn i -> try do JSEngine.__test_low_memory__(i) rescue e -> {:error, Exception.message(e)} end end) |> Enum.uniq() do
+    [{:ok, "null"}] -> per.(R.footprint_kb(pid))
+    other -> "n/a (#{inspect(other)})"
+  end
+
+Enum.each(isos, &JSEngine.destroy/1)
+
+# 2. Speed.
 results =
   for _ <- 1..runs do
     i = start.()
@@ -112,21 +143,25 @@ results =
     res
   end
 
-la1 = R.loadavg()
-:erlang.garbage_collect()
-f0 = R.footprint_kb(pid)
-r0 = R.rss_kb(pid)
-isos = for _ <- 1..held, do: (i = start.(); R.replay(i, init, pages); i)
-f1 = R.footprint_kb(pid)
-r1 = R.rss_kb(pid)
-Enum.each(isos, &JSEngine.destroy/1)
-
-hashes = results |> Enum.map(fn {_, a, b} -> {a, b} end) |> Enum.uniq()
+hashes = (results ++ held_results) |> Enum.map(fn {_, a, b} -> {a, b} end) |> Enum.uniq()
 times = Enum.map(results, &elem(&1, 0))
 
 IO.puts("""
-replay mode=#{mode} pages=#{length(pages)} runs=#{runs} cpu=#{cpu} load #{la0} -> #{la1}
-  replay ms: #{Enum.map_join(times, " / ", &:erlang.float_to_binary(&1, decimals: 1))}  median #{:erlang.float_to_binary(R.med(times), decimals: 1)}
-  hashes: #{Enum.map_join(hashes, "; ", fn {a, b} -> "replies sha1=#{a} workspace sha1=#{b}" end)}
-  memory (#{held} replayed isolates held): footprint +#{div(f1 - f0, held)} KB, rss +#{div(r1 - r0, held)} KB per isolate  [load #{R.loadavg()}]
+replay mode=#{mode} pages=#{length(pages)} runs=#{runs} held=#{held} cpu=#{cpu} load #{la0} -> #{R.loadavg()}
+  replay ms: #{Enum.map_join(times, " / ", &R.f1/1)}  median #{R.f1(R.med(times))}
+  hashes (#{length(results) + length(held_results)} replays): #{Enum.map_join(hashes, "; ", fn {a, b} -> "replies sha1=#{a} workspace sha1=#{b}" end)}
+  footprint KB per isolate: fresh idle +#{fresh}, after replay +#{replayed}, after 10 s idle +#{idle}, after low-memory notification +#{low}
 """)
+
+cond do
+  length(hashes) != 1 ->
+    IO.puts(:stderr, "FAIL: replays differ")
+    System.halt(1)
+
+  expected != nil and hashes != [expected] ->
+    IO.puts(:stderr, "FAIL: hashes differ from the expected #{inspect(expected)}")
+    System.halt(1)
+
+  true ->
+    :ok
+end

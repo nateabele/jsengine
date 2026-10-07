@@ -511,3 +511,14 @@ fn real_bundle_heap_after_start() {
         heap(&mut started)
     );
 }
+
+#[test]
+fn a_bundle_that_churns_young_garbage_at_load_snapshots_at_the_smallest_heap() {
+    // About 160 MB allocated at load, almost all of it dead at once: the heap
+    // guard must not count the dead young objects against `heap_mb` (16 MiB,
+    // the smallest), as it did not before the young generation grew.
+    let code = "var total = 0; for (var i = 0; i < 20000; i++) { var a = new Array(1000).fill(i); total += a.length; } globalThis.kept = () => total;";
+    let snapshot = create("churn.js", code.to_string(), TIMEOUT, 16).expect("snapshot at heap_mb 16");
+    let isolate = Isolate::spawn_from(64, Some(Arc::new(snapshot))).expect("spawn");
+    assert_eq!(call(&isolate, "kept", "[]", TIMEOUT), Reply::Value("20000000".into()));
+}

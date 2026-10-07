@@ -76,6 +76,10 @@ pub enum Command {
         timeout: Duration,
         reply: ReplyFn,
     },
+    /// Sends V8 a low-memory notification (a full GC that may also shrink
+    /// the young generation), then replies `null`. `test_hooks` only: the
+    /// memory measurements use it.
+    LowMemory { reply: ReplyFn },
     Shutdown { ack: Option<Sender<()>> },
 }
 
@@ -84,6 +88,7 @@ enum Job {
     Call { fun: String, args_json: String },
     Panic,
     Stall(Duration),
+    LowMemory,
 }
 
 /// State shared by the isolate thread, the watchdog and the NIF side.
@@ -228,6 +233,7 @@ fn split(command: Command) -> Result<(ReplyFn, Duration, Job), Option<Sender<()>
             timeout,
             reply,
         } => Ok((reply, timeout, Job::Stall(stall))),
+        Command::LowMemory { reply } => Ok((reply, Duration::from_secs(30), Job::LowMemory)),
         Command::Shutdown { ack } => Err(ack),
     }
 }
@@ -400,6 +406,10 @@ fn execute(
         Job::Panic => panic!("jsengine test hook: deliberate panic"),
         Job::Stall(stall) => {
             std::thread::sleep(stall);
+            Ok(Reply::Value("null".to_string()))
+        }
+        Job::LowMemory => {
+            runtime.v8_isolate().low_memory_notification();
             Ok(Reply::Value("null".to_string()))
         }
     };

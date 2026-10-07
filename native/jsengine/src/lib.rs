@@ -40,6 +40,7 @@ rustler::init!(
         isolate_cancel,
         isolate_test_panic,
         isolate_test_stall,
+        isolate_test_low_memory,
         snapshot_create,
         snapshot_info,
         snapshot_to_binary,
@@ -339,6 +340,21 @@ fn isolate_test_stall<'a>(
                 timeout: Duration::from_millis(timeout_ms),
                 reply,
             })
+        } else {
+            (atoms::error(), atoms::unsupported()).encode(env)
+        }
+    })
+}
+
+#[rustler::nif]
+fn isolate_test_low_memory<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<IsolateResource>,
+    tag: Term<'a>,
+) -> Term<'a> {
+    guard(env, || {
+        if cfg!(feature = "test_hooks") {
+            queued(env, &resource, tag, |reply| Command::LowMemory { reply })
         } else {
             (atoms::error(), atoms::unsupported()).encode(env)
         }

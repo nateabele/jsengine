@@ -74,29 +74,36 @@ pub(crate) fn bootstrap(runtime: &mut JsRuntime) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// The semi-space size, in MiB, of every isolate of this process: V8's
+/// The largest semi-space, in MiB, of every isolate of this process. V8's
 /// young generation is two semi-spaces plus a new large-object space of the
-/// same size, so 3 x this.
+/// same size, so up to 3 x this.
 ///
 /// Without it V8 derives the young generation from the `heap_limits` cap:
 /// at the 256 MiB default that is a 1 MiB semi-space, and the minor GCs
 /// dominate a long replay (aravis cold start: see unitB-report.md). rusty_v8
 /// 0.81 has no per-isolate setter for the young generation (the
 /// `ResourceConstraints` fields are private), so it is a process-wide V8
-/// flag. The flag wins over the size derived from `heap_limits`, and it
-/// leaves the old generation as `heap_limits` sized it: the `:oom` limit
-/// (the old-generation budget) does not shrink, and the heap's total
-/// reservation grows by 3 x (this - 1) MiB per isolate.
+/// flag. The flag wins over the size derived from `heap_limits` and leaves
+/// the old generation as `heap_limits` sized it. So `heap_mb` caps the old
+/// generation only: the `:oom` budget does not shrink, and the young
+/// generation comes on top, up to 3 x 8 = 24 MiB per isolate.
 ///
-/// 16 MiB is the knee of the measured curve (Node's default too): the
-/// aravis cold-start replay is about 40% faster than at 1 MiB, 32 MiB is no
-/// faster, and a replayed isolate holds about 20 MiB more (32 MiB: 55 MiB).
-pub(crate) const SEMI_SPACE_MB: usize = 16;
+/// The memory is resident, not only reserved: V8 keeps a grown semi-space
+/// for the life of the isolate, because jsengine never runs V8's idle tasks
+/// (the memory reducer). Measured on the aravis cold-start replay
+/// (unitB-report.md, bake-off): a fresh isolate costs nothing more; after
+/// the replay an isolate keeps about +5.5 MB, idle or not, until a full GC
+/// such as a low-memory notification. The replay is about 27% faster than
+/// at 1 MiB. 16 MiB was faster still (about 35%) but kept about +22 MB.
+///
+/// There is no `--min-semi-space-size`: the semi-space starts at V8's
+/// smallest size and grows only in an isolate that needs it.
+pub(crate) const SEMI_SPACE_MB: usize = 8;
 
-/// The semi-space an isolate starts with, in MiB. Starting at full size
-/// skips the scavenges that would grow it, and measured steadier than
-/// growing from 1 MiB, at the same memory once a replay has run.
-pub(crate) const INITIAL_SEMI_SPACE_MB: usize = 16;
+/// jsengine's V8 flags: the young-generation size.
+pub(crate) fn v8_flags() -> String {
+    format!("--max-semi-space-size={SEMI_SPACE_MB}")
+}
 
 /// Sets jsengine's V8 flags, then initialises V8 (once per process). Every
 /// path that makes a runtime calls this first, so the flags are set before
@@ -105,9 +112,7 @@ pub(crate) const INITIAL_SEMI_SPACE_MB: usize = 16;
 pub(crate) fn init_v8() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        v8::V8::set_flags_from_string(&format!(
-            "--max-semi-space-size={SEMI_SPACE_MB} --min-semi-space-size={INITIAL_SEMI_SPACE_MB}"
-        ));
+        v8::V8::set_flags_from_string(&v8_flags());
         JsRuntime::init_platform(None);
     });
 }

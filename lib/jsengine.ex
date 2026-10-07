@@ -67,6 +67,8 @@ defmodule JSEngine do
   @doc false
   def isolate_test_stall(_isolate, _stall_ms, _timeout_ms, _tag), do: error()
   @doc false
+  def isolate_test_low_memory(_isolate, _tag), do: error()
+  @doc false
   def isolate_cancel(_ticket), do: error()
   @doc false
   def snapshot_create(_name, _code, _timeout_ms, _heap_mb), do: error()
@@ -93,8 +95,13 @@ defmodule JSEngine do
   Starts an isolate on its own OS thread.
 
   Options:
-    * `:heap_mb`, the V8 heap limit in MiB (default #{@default_heap_mb}).
-      Reaching the limit makes the running call return `{:error, :oom}`.
+    * `:heap_mb`, the limit of V8's old generation in MiB (default
+      #{@default_heap_mb}). Reaching it makes the running call return
+      `{:error, :oom}`. The young generation is not part of it: it adds up to
+      24 MiB per isolate on top (3 semi-spaces of up to 8 MiB). It grows only
+      in an isolate that allocates heavily, and V8 keeps it for the isolate's
+      life (measured: about +5.5 MB after the aravis cold-start replay, none
+      for a fresh isolate). Size a node for `heap_mb` + 24 MiB per isolate.
     * `:snapshot`, a snapshot from `create_snapshot/3` or `snapshot_for/3`:
       the isolate starts with that bundle already loaded (D54).
 
@@ -338,6 +345,26 @@ defmodule JSEngine do
           {:jsengine_reply, ^tag, result} -> result
         after
           timeout_ms + reply_grace_ms() -> give_up(isolate, ticket, tag)
+        end
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  @doc false
+  # Test hook: sends V8 a low-memory notification on the isolate thread (a full
+  # GC that may shrink the young generation). `test_hooks` builds only; the
+  # memory bench uses it.
+  def __test_low_memory__(isolate) do
+    tag = make_ref()
+
+    case isolate_test_low_memory(isolate, tag) do
+      {:ok, ticket} ->
+        receive do
+          {:jsengine_reply, ^tag, result} -> result
+        after
+          30_000 + reply_grace_ms() -> give_up(isolate, ticket, tag)
         end
 
       {:error, _} = error ->

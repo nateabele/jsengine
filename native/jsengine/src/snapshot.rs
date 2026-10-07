@@ -206,14 +206,30 @@ fn snapshot_thread(
     });
     bootstrap(&mut runtime)
         .map_err(|e| Failure::Panic(format!("cannot start the runtime: {e}")))?;
+    #[cfg(test)]
+    {
+        let mut stats = v8::HeapStatistics::default();
+        runtime.v8_isolate().get_heap_statistics(&mut stats);
+        SNAPSHOT_HEAP_LIMIT.store(stats.heap_size_limit(), SeqCst);
+    }
 
     // Heap cap. deno_core ignores `create_params` for a snapshotting runtime,
     // so V8 would only stop at its default limit, with a fatal OOM that ends
     // the BEAM. A GC prologue callback stops the script once the heap passes
     // `heap_mb`; the near-heap-limit callback is the backstop at V8's own
     // limit. Both terminate execution and the result is `Oom`.
+    //
+    // `used_heap_size` counts the young generation too, dead objects
+    // included (the prologue runs before the GC). Like a hardened isolate's
+    // `heap_mb`, the cap is meant for the old generation: the guard allows
+    // the young space that `SEMI_SPACE_MB` adds over V8's smallest young
+    // generation (3 MiB, what `heap_limits` gave before), so a bundle that
+    // snapshotted at a small `heap_mb` before still does.
     let guard = Box::new(HeapGuard {
-        cap_bytes: heap_mb.max(16).saturating_mul(1024 * 1024),
+        cap_bytes: heap_mb
+            .max(16)
+            .saturating_add(young_allowance_mb())
+            .saturating_mul(1024 * 1024),
         handle: runtime.v8_isolate().thread_safe_handle(),
         oom: AtomicBool::new(false),
     });
@@ -278,6 +294,18 @@ fn snapshot_thread(
             blob: Arc::from(&*blob),
         }),
     }
+}
+
+/// The `heap_size_limit` of the last snapshotting isolate (tests only).
+#[cfg(test)]
+pub(crate) static SNAPSHOT_HEAP_LIMIT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The young space, in MiB, that the snapshot heap guard allows over
+/// `heap_mb`: the 3 x semi-space young generation minus the 3 MiB one that a
+/// `heap_limits` cap gave before jsengine sized the young generation.
+pub(crate) fn young_allowance_mb() -> usize {
+    3 * crate::engine::SEMI_SPACE_MB.saturating_sub(1)
 }
 
 /// The heap cap of a snapshotting isolate (see `snapshot_thread`).
