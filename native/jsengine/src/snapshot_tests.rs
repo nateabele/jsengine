@@ -565,3 +565,11 @@ fn a_timer_cleared_at_load_snapshots_and_a_live_one_is_refused() {
         }
     }
 }
+
+#[test]
+fn a_low_memory_notification_frees_a_worked_isolate_started_from_a_snapshot() {
+    let isolate = Isolate::spawn_from(256, Some(snapshot_of(BUNDLE))).expect("spawn from snapshot");
+    crate::isolate::tests::assert_low_memory_frees_a_worked_isolate(&isolate);
+    // The snapshot's state survives the GC.
+    assert_eq!(call(&isolate, "sum", "[]", TIMEOUT), Reply::Value("332833500".into()));
+}

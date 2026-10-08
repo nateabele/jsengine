@@ -108,4 +108,30 @@ defmodule JSEngine.IsolateMemoryTest do
     assert after_kb.live - plateau.live <= 12 * 1024,
            "KB, footprint less malloc fragmentation: plateau #{inspect(plateau)}, after 400 more isolates #{inspect(after_kb)}"
   end
+
+  @tag timeout: 60_000
+  if :os.type() != {:unix, :darwin}, do: @tag(skip: "measures the macOS physical footprint")
+
+  test "a low-memory notification returns a worked isolate's garbage to the OS" do
+    {:ok, isolate} = JSEngine.create_isolate(%{heap_mb: 512})
+    on_exit(fn -> JSEngine.destroy(isolate) end)
+
+    :ok =
+      JSEngine.load_source(
+        isolate,
+        "churn.js",
+        "globalThis.fill = () => { globalThis.hold = []; for (let i = 0; i < 800; i++) hold.push(new Array(25000).fill(i + 0.5)); return hold.length; };" <>
+          " globalThis.release = () => { globalThis.hold = null; return 0; };"
+      )
+
+    # 160 MB of arrays, made and dropped: V8 keeps them until a major GC.
+    assert {:ok, "800"} = JSEngine.call(isolate, "fill", "[]", 30_000)
+    assert {:ok, "0"} = JSEngine.call(isolate, "release", "[]", 1_000)
+    before = live_kb()
+    assert :ok = JSEngine.low_memory_notification(isolate)
+    after_kb = live_kb()
+
+    assert before.footprint - after_kb.footprint >= 100 * 1024,
+           "KB: before #{inspect(before)}, after #{inspect(after_kb)}"
+  end
 end

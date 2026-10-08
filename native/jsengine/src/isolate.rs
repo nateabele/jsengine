@@ -40,6 +40,8 @@ impl Failure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
     Loaded,
+    /// A command that returns nothing (`LowMemory`) finished.
+    Done,
     Value(String),
     Failed(Failure),
 }
@@ -76,9 +78,12 @@ pub enum Command {
         timeout: Duration,
         reply: ReplyFn,
     },
-    /// Sends V8 a low-memory notification (a full GC that may also shrink
-    /// the young generation), then replies `null`. `test_hooks` only: the
-    /// memory measurements use it.
+    /// Sends V8 a low-memory notification: a full, compacting GC that also
+    /// shrinks the young generation and returns the freed pages to the OS.
+    /// Replies `Done`. Like every command it waits in the isolate's queue, so
+    /// it never runs while a call is in flight, and a call queued after it
+    /// waits for it (about 2 ms on a fresh isolate, about 5 ms on one that
+    /// replayed the aravis 10k cold start).
     LowMemory { reply: ReplyFn },
     Shutdown { ack: Option<Sender<()>> },
 }
@@ -99,6 +104,10 @@ pub struct Shared {
     oom: AtomicBool,
     destroyed: AtomicBool,
     dead: AtomicBool,
+    /// The heap's physical size (bytes) just before and just after each
+    /// low-memory notification, for the tests.
+    #[cfg(test)]
+    pub(crate) low_memory_log: Mutex<Vec<(usize, usize)>>,
 }
 
 static NEXT_CALL: AtomicU64 = AtomicU64::new(1);
@@ -275,6 +284,8 @@ fn start(heap_mb: usize, snapshot: Option<&StartupSnapshot>) -> Result<Parts, Fa
         oom: AtomicBool::new(false),
         destroyed: AtomicBool::new(false),
         dead: AtomicBool::new(false),
+        #[cfg(test)]
+        low_memory_log: Mutex::new(Vec::new()),
     });
     let on_limit = shared.clone();
     // V8 calls this from an extern "C" frame, where an unwinding panic
@@ -409,13 +420,28 @@ fn execute(
             Ok(Reply::Value("null".to_string()))
         }
         Job::LowMemory => {
+            #[cfg(test)]
+            let before = heap_physical(runtime);
             runtime.v8_isolate().low_memory_notification();
-            Ok(Reply::Value("null".to_string()))
+            #[cfg(test)]
+            shared
+                .low_memory_log
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((before, heap_physical(runtime)));
+            Ok(Reply::Done)
         }
     };
     shared.end_call();
     watchdog::disarm(deadline, seq);
     classify(shared, outcome)
+}
+
+#[cfg(test)]
+fn heap_physical(runtime: &mut JsRuntime) -> usize {
+    let mut stats = v8::HeapStatistics::default();
+    runtime.v8_isolate().get_heap_statistics(&mut stats);
+    stats.total_physical_size()
 }
 
 fn classify(shared: &Shared, outcome: Result<Reply, String>) -> Reply {

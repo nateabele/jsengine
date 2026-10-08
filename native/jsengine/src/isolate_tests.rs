@@ -419,3 +419,116 @@ pub(crate) fn assert_a_thrown_handler_is_released(snapshot: Option<&crate::snaps
 fn a_throwing_handler_is_released_and_later_timers_fire() {
     assert_a_thrown_handler_is_released(None);
 }
+
+// ---------------------------------------------------------------------------
+// Low-memory notification (`JSEngine.low_memory_notification/2`).
+// ---------------------------------------------------------------------------
+
+const MB: usize = 1024 * 1024;
+
+/// Builds 40 MB of arrays, then drops them: garbage that V8 keeps until a
+/// major GC (jsengine runs no idle tasks, so nothing else collects it).
+const CHURN: &str = r#"
+globalThis.fill = () => { globalThis.hold = []; for (let i = 0; i < 200; i++) hold.push(new Array(25000).fill(i + 0.5)); return hold.length; };
+globalThis.release = () => { globalThis.hold = null; return 0; };
+globalThis.one = () => 1;
+globalThis.wait = (ms) => new Promise((r) => setTimeout(() => r(ms), ms));
+"#;
+
+pub(crate) fn low_memory(isolate: &Isolate) -> Reply {
+    request(isolate, |reply| Command::LowMemory { reply })
+}
+
+fn last_low_memory(isolate: &Isolate) -> (usize, usize) {
+    *isolate.shared.low_memory_log.lock().unwrap().last().expect("no notification ran")
+}
+
+/// On an isolate that made and dropped 40 MB, the notification replies `Done`
+/// and the heap's physical size falls by most of it; a second one right
+/// after frees nothing more. The isolate keeps its state.
+pub(crate) fn assert_low_memory_frees_a_worked_isolate(isolate: &Isolate) {
+    if load(isolate, CHURN) != Reply::Loaded {
+        panic!("churn did not load");
+    }
+    assert_eq!(call(isolate, "fill", "[]", TIMEOUT), Reply::Value("200".into()));
+    assert_eq!(call(isolate, "release", "[]", TIMEOUT), Reply::Value("0".into()));
+    let started = Instant::now();
+    assert_eq!(low_memory(isolate), Reply::Done);
+    let took = started.elapsed();
+    let (before, after) = last_low_memory(isolate);
+    println!("[low-memory] worked isolate: heap physical {} -> {} KB in {took:?}", before / 1024, after / 1024);
+    assert!(before > after + 30 * MB, "the notification freed too little: {before} -> {after}");
+    assert_eq!(low_memory(isolate), Reply::Done);
+    let (again_before, again_after) = last_low_memory(isolate);
+    assert!(again_before < after + 2 * MB && again_after <= again_before + MB, "{again_before} -> {again_after}");
+    assert!(isolate.is_alive());
+    assert_eq!(call(isolate, "one", "[]", TIMEOUT), Reply::Value("1".into()));
+}
+
+#[test]
+fn a_low_memory_notification_frees_a_worked_isolates_garbage() {
+    let isolate = Isolate::spawn(256).expect("spawn");
+    assert_low_memory_frees_a_worked_isolate(&isolate);
+}
+
+#[test]
+fn a_low_memory_notification_on_a_fresh_isolate_is_a_fast_no_op() {
+    let isolate = Isolate::spawn(256).expect("spawn");
+    let started = Instant::now();
+    assert_eq!(low_memory(&isolate), Reply::Done);
+    let took = started.elapsed();
+    let (before, after) = last_low_memory(&isolate);
+    println!("[low-memory] fresh isolate: heap physical {} -> {} KB in {took:?}", before / 1024, after / 1024);
+    // About 2 ms measured; the bound only catches a pathological cost.
+    assert!(took < Duration::from_millis(250), "{took:?}");
+    assert!(before < after + 2 * MB, "a fresh isolate had garbage to free: {before} -> {after}");
+    assert!(isolate.is_alive());
+}
+
+#[test]
+fn a_low_memory_notification_to_a_destroyed_isolate_is_dead() {
+    let isolate = Isolate::spawn(64).expect("spawn");
+    isolate.shutdown(Some(Duration::from_secs(2)));
+    assert_eq!(low_memory(&isolate), Reply::Failed(Failure::Dead));
+    let retired = Isolate::spawn(64).expect("spawn");
+    load(&retired, "globalThis.spin = () => { while (true) {} };");
+    assert_eq!(call(&retired, "spin", "[]", Duration::from_millis(100)), Reply::Failed(Failure::Timeout));
+    assert_eq!(low_memory(&retired), Reply::Failed(Failure::Dead));
+}
+
+/// The notification waits in the queue behind a call in flight, and a call
+/// queued after it waits for it: replies come back in submission order.
+#[test]
+fn a_low_memory_notification_queues_behind_a_call_in_flight() {
+    let isolate = Isolate::spawn(256).expect("spawn");
+    assert_eq!(load(&isolate, CHURN), Reply::Loaded);
+    assert_eq!(call(&isolate, "fill", "[]", TIMEOUT), Reply::Value("200".into()));
+    let (tx, rx) = channel::<(&'static str, Reply, Instant)>();
+    let sender = |label: &'static str| -> ReplyFn {
+        let tx = tx.clone();
+        Box::new(move |r| {
+            let _ = tx.send((label, r, Instant::now()));
+        })
+    };
+    let started = Instant::now();
+    isolate
+        .submit(Command::Call { fun: "wait".into(), args_json: "[200]".into(), timeout: TIMEOUT, reply: sender("wait") })
+        .expect("submit wait");
+    isolate.submit(Command::LowMemory { reply: sender("gc") }).expect("submit gc");
+    isolate
+        .submit(Command::Call { fun: "release".into(), args_json: "[]".into(), timeout: TIMEOUT, reply: sender("release") })
+        .expect("submit release");
+    let replies: Vec<_> = (0..3).map(|_| rx.recv_timeout(Duration::from_secs(30)).expect("reply")).collect();
+    let order: Vec<_> = replies.iter().map(|(label, _, _)| *label).collect();
+    assert_eq!(order, ["wait", "gc", "release"]);
+    assert_eq!(replies[0].1, Reply::Value("200".into()));
+    assert_eq!(replies[1].1, Reply::Done);
+    assert_eq!(replies[2].1, Reply::Value("0".into()));
+    assert!(replies[1].2.duration_since(started) >= Duration::from_millis(200), "the GC did not wait for the call");
+    // The GC ran while `hold` was still live (before `release`): it kept it.
+    let (_, after) = last_low_memory(&isolate);
+    assert!(after > 30 * MB, "the live arrays were collected: heap physical {after}");
+    assert_eq!(low_memory(&isolate), Reply::Done);
+    let (_, released) = last_low_memory(&isolate);
+    assert!(released + 30 * MB < after, "the released arrays were not freed: {after} -> {released}");
+}

@@ -8,7 +8,7 @@
 # 1. Memory, first, in a BEAM that has not run an isolate yet: `held` isolates (default 4) are
 #    started and held. The physical footprint per isolate is taken when they are fresh and idle,
 #    after each has replayed, after 10 s idle, and after a V8 low-memory notification
-#    (`JSEngine.__test_low_memory__/1`: MIX_ENV=test builds only; elsewhere that step is skipped).
+#    (`JSEngine.__test_low_memory__/1`, which wraps `low_memory_notification/1`; an older NIF without it skips that step).
 # 2. Speed: `runs` replays (default 3), each in a fresh isolate.
 #
 # Every replay is hashed (replies and final workspace). The bench exits 1 when two replays differ,

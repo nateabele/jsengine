@@ -196,4 +196,77 @@ defmodule JSEngine.IsolateTest do
       assert {:error, {:js, _}} = JSEngine.call(b, "who", "[]", 1_000)
     end
   end
+
+  describe "low_memory_notification/2" do
+    @churn """
+    globalThis.fill = () => { globalThis.hold = []; for (let i = 0; i < 200; i++) hold.push(new Array(25000).fill(i + 0.5)); return hold.length; };
+    globalThis.release = () => { globalThis.hold = null; return 0; };
+    globalThis.held = () => (globalThis.hold ? hold.length : 0);
+    globalThis.wait = (ms) => new Promise((r) => setTimeout(() => r(ms), ms));
+    """
+
+    test "is :ok on a worked isolate, which keeps its state" do
+      isolate = isolate!(%{heap_mb: 256})
+      :ok = JSEngine.load_source(isolate, "churn.js", @churn)
+      assert {:ok, "200"} = JSEngine.call(isolate, "fill", "[]", 5_000)
+      assert :ok = JSEngine.low_memory_notification(isolate)
+      assert {:ok, "200"} = JSEngine.call(isolate, "held", "[]", 1_000)
+      assert {:ok, "0"} = JSEngine.call(isolate, "release", "[]", 1_000)
+      assert :ok = JSEngine.low_memory_notification(isolate)
+      assert JSEngine.alive?(isolate)
+    end
+
+    test "is a fast no-op on a fresh isolate" do
+      isolate = isolate!()
+      {us, result} = :timer.tc(fn -> JSEngine.low_memory_notification(isolate) end)
+      assert result == :ok
+      # About 2 ms measured; the bound only catches a pathological cost.
+      assert us < 250_000, "took #{div(us, 1000)} ms"
+    end
+
+    test "is {:error, :dead} on a destroyed or retired isolate" do
+      destroyed = isolate!()
+      :ok = JSEngine.destroy(destroyed)
+      assert {:error, :dead} = JSEngine.low_memory_notification(destroyed)
+
+      retired = isolate!()
+      :ok = JSEngine.load_source(retired, "spin.js", "globalThis.spin = () => { while (true) {} };")
+      assert {:error, :timeout} = JSEngine.call(retired, "spin", "[]", 100)
+      assert {:error, :dead} = JSEngine.low_memory_notification(retired)
+    end
+
+    test "waits behind a call in flight, and a call sent during it answers normally" do
+      isolate = isolate!(%{heap_mb: 256})
+      :ok = JSEngine.load_source(isolate, "churn.js", @churn)
+      assert {:ok, "200"} = JSEngine.call(isolate, "fill", "[]", 5_000)
+      t0 = System.monotonic_time(:millisecond)
+      slow = Task.async(fn -> {JSEngine.call(isolate, "wait", "[300]", 5_000), System.monotonic_time(:millisecond)} end)
+      Process.sleep(50)
+      gc = Task.async(fn -> {JSEngine.low_memory_notification(isolate), System.monotonic_time(:millisecond)} end)
+      Process.sleep(20)
+      during = Task.async(fn -> {JSEngine.call(isolate, "held", "[]", 5_000), System.monotonic_time(:millisecond)} end)
+      {slow_result, slow_at} = Task.await(slow)
+      {gc_result, gc_at} = Task.await(gc)
+      {during_result, during_at} = Task.await(during)
+      assert slow_result == {:ok, "300"}
+      assert gc_result == :ok
+      assert during_result == {:ok, "200"}
+      assert gc_at - t0 >= 300 and gc_at >= slow_at, "the notification did not wait for the call in flight"
+      assert during_at >= gc_at
+    end
+
+    test "works on an isolate started from a snapshot" do
+      {:ok, snapshot} = JSEngine.create_snapshot("churn.js", @churn)
+      isolate = isolate!(%{heap_mb: 256, snapshot: snapshot})
+      assert {:ok, "200"} = JSEngine.call(isolate, "fill", "[]", 5_000)
+      assert {:ok, "0"} = JSEngine.call(isolate, "release", "[]", 1_000)
+      assert :ok = JSEngine.low_memory_notification(isolate)
+      assert {:ok, "50"} = JSEngine.call(isolate, "wait", "[50]", 1_000)
+    end
+
+    test "__test_low_memory__/1 keeps its old reply" do
+      isolate = isolate!()
+      assert {:ok, "null"} = JSEngine.__test_low_memory__(isolate)
+    end
+  end
 end

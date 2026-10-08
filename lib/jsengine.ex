@@ -4,7 +4,8 @@ defmodule JSEngine do
 
   Two APIs live here:
 
-    * **Isolates** (`create_isolate/1`, `load_source/3`, `call/4`, `destroy/1`):
+    * **Isolates** (`create_isolate/1`, `load_source/3`, `call/4`,
+      `low_memory_notification/2`, `destroy/1`):
       one OS thread per isolate, a heap limit, a deadline per call, and a
       structured error for every host failure. Use this API.
     * **Startup snapshots** (`create_snapshot/3`, `snapshot_for/3`): load a
@@ -67,7 +68,7 @@ defmodule JSEngine do
   @doc false
   def isolate_test_stall(_isolate, _stall_ms, _timeout_ms, _tag), do: error()
   @doc false
-  def isolate_test_low_memory(_isolate, _tag), do: error()
+  def isolate_low_memory(_isolate, _tag), do: error()
   @doc false
   def isolate_cancel(_ticket), do: error()
   @doc false
@@ -304,6 +305,56 @@ defmodule JSEngine do
   end
 
   @doc """
+  Sends V8 a low-memory notification: a full, compacting GC that also
+  shrinks the young generation and returns the freed pages to the OS. V8
+  never does this by itself in jsengine (it runs no idle tasks), so an
+  isolate that worked hard keeps its garbage and its grown young generation
+  until it is called.
+
+  Measured (aravis bundle, D54 snapshot isolate, M5 Max): after the 10k
+  cold-start replay it takes about 5 ms and the isolate's footprint drops
+  from about 46 MB to about 14 MB; on a fresh isolate it takes about 2 ms and
+  frees nothing.
+
+  It runs on the isolate thread, queued like a call: it waits for the work
+  queued before it (a call in flight finishes first), and work queued after
+  it waits for it. It never runs at the same time as a call. The NIF only
+  queues it (normal scheduler, no blocking); the caller waits in `receive`.
+
+  Returns `:ok`, or `{:error, failure}`:
+    * `{:error, :dead}`: the isolate was destroyed or has retired;
+    * `{:error, :timeout}`: no reply within `timeout_ms` (default 30 s; it
+      counts the wait in the queue too). The isolate is not discarded: the
+      notification stays queued and still runs, and a stuck call in front of
+      it is ended by that call's own deadline.
+  """
+  @spec low_memory_notification(isolate(), pos_integer()) :: :ok | {:error, failure()}
+  def low_memory_notification(isolate, timeout_ms \\ 30_000)
+      when is_integer(timeout_ms) and timeout_ms > 0 do
+    timeout_ms = min(timeout_ms, @max_timeout_ms)
+    tag = make_ref()
+
+    case isolate_low_memory(isolate, tag) do
+      {:ok, ticket} ->
+        receive do
+          {:jsengine_reply, ^tag, result} -> result
+        after
+          timeout_ms ->
+            isolate_cancel(ticket)
+
+            receive do
+              {:jsengine_reply, ^tag, result} -> result
+            after
+              0 -> {:error, :timeout}
+            end
+        end
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  @doc """
   Discards the isolate: stops a running call, frees its heap and ends its
   thread (waits up to 2 s). Later calls return `{:error, :dead}`.
   """
@@ -353,22 +404,12 @@ defmodule JSEngine do
   end
 
   @doc false
-  # Test hook: sends V8 a low-memory notification on the isolate thread (a full
-  # GC that may shrink the young generation). `test_hooks` builds only; the
-  # memory bench uses it.
+  # The former test hook, kept for the memory benches: `low_memory_notification/1`
+  # with the old reply (`{:ok, "null"}`). It now works in every build.
   def __test_low_memory__(isolate) do
-    tag = make_ref()
-
-    case isolate_test_low_memory(isolate, tag) do
-      {:ok, ticket} ->
-        receive do
-          {:jsengine_reply, ^tag, result} -> result
-        after
-          30_000 + reply_grace_ms() -> give_up(isolate, ticket, tag)
-        end
-
-      {:error, _} = error ->
-        error
+    case low_memory_notification(isolate) do
+      :ok -> {:ok, "null"}
+      {:error, _} = error -> error
     end
   end
 

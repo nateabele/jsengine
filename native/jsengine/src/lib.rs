@@ -40,7 +40,7 @@ rustler::init!(
         isolate_cancel,
         isolate_test_panic,
         isolate_test_stall,
-        isolate_test_low_memory,
+        isolate_low_memory,
         snapshot_create,
         snapshot_info,
         snapshot_to_binary,
@@ -201,7 +201,7 @@ fn error_term<'a>(env: Env<'a>, failure: &Failure) -> Term<'a> {
 
 fn reply_term<'a>(env: Env<'a>, reply: &Reply) -> Term<'a> {
     match reply {
-        Reply::Loaded => atoms::ok().encode(env),
+        Reply::Loaded | Reply::Done => atoms::ok().encode(env),
         Reply::Value(json) => (atoms::ok(), json.as_str()).encode(env),
         Reply::Failed(failure) => error_term(env, failure),
     }
@@ -346,19 +346,19 @@ fn isolate_test_stall<'a>(
     })
 }
 
+/// Queues a V8 low-memory notification behind the isolate's pending work
+/// (`JSEngine.low_memory_notification/2`). The GC runs on the isolate
+/// thread, which sends `{:jsengine_reply, tag, :ok}` when it is done.
+// A normal scheduler: like `isolate_alive`, this only does a non-blocking
+// channel send, with no argument to decode or copy (`isolate_call` is dirty
+// only for its multi-MB `args_json`).
 #[rustler::nif]
-fn isolate_test_low_memory<'a>(
+fn isolate_low_memory<'a>(
     env: Env<'a>,
     resource: ResourceArc<IsolateResource>,
     tag: Term<'a>,
 ) -> Term<'a> {
-    guard(env, || {
-        if cfg!(feature = "test_hooks") {
-            queued(env, &resource, tag, |reply| Command::LowMemory { reply })
-        } else {
-            (atoms::error(), atoms::unsupported()).encode(env)
-        }
-    })
+    guard(env, || queued(env, &resource, tag, |reply| Command::LowMemory { reply }))
 }
 
 // ---------------------------------------------------------------------------
