@@ -311,10 +311,11 @@ defmodule JSEngine do
   isolate that worked hard keeps its garbage and its grown young generation
   until it is called.
 
-  Measured (aravis bundle, D54 snapshot isolate, M5 Max): after the 10k
-  cold-start replay it takes about 5 ms and the isolate's footprint drops
-  from about 46 MB to about 14 MB; on a fresh isolate it takes about 2 ms and
-  frees nothing.
+  Measured (aravis bundle, D54 snapshot isolate, M5 Max; aravis
+  `.superpowers/sdd/2026-10-07-low-memory/low-memory-report.md`, server
+  `log_bench.exs low_memory`): after the 10k cold-start replay it takes
+  about 9 ms and the workspace's footprint drops from about 47 MB to about
+  12.7 MB; on a fresh isolate it takes about 2 ms and frees nothing.
 
   It runs on the isolate thread, queued like a call: it waits for the work
   queued before it (a call in flight finishes first), and work queued after

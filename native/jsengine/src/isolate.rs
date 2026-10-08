@@ -82,8 +82,8 @@ pub enum Command {
     /// shrinks the young generation and returns the freed pages to the OS.
     /// Replies `Done`. Like every command it waits in the isolate's queue, so
     /// it never runs while a call is in flight, and a call queued after it
-    /// waits for it (about 2 ms on a fresh isolate, about 5 ms on one that
-    /// replayed the aravis 10k cold start).
+    /// waits for it (about 2 ms on a fresh isolate, about 9 ms on one that
+    /// replayed the aravis 10k cold start: aravis low-memory-report.md).
     LowMemory { reply: ReplyFn },
     Shutdown { ack: Option<Sender<()>> },
 }
@@ -242,6 +242,12 @@ fn split(command: Command) -> Result<(ReplyFn, Duration, Job), Option<Sender<()>
             timeout,
             reply,
         } => Ok((reply, timeout, Job::Stall(stall))),
+        // A fixed 30 s watchdog, not the caller's `timeout_ms`: that one only
+        // bounds the caller's wait, which includes the time queued behind
+        // other work, and it ends in a cancelled reply, never a discarded
+        // isolate. A GC is not JavaScript, so the watchdog cannot interrupt
+        // it anyway; it is only a backstop for a pathological GC (measured
+        // ~9 ms), after which the isolate retires as for any timeout.
         Command::LowMemory { reply } => Ok((reply, Duration::from_secs(30), Job::LowMemory)),
         Command::Shutdown { ack } => Err(ack),
     }
